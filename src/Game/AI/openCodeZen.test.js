@@ -1,7 +1,9 @@
-/*! Open Historia — portions (OpenCode Zen adapter regression tests) © 2026 Nicholas Krol, MIT (see src/Editor/LICENSE). */
+/*! Open Historia — portions (OpenCode Zen adapter regression tests) © 2026 Nicholas Krol, AGPL-3.0-or-later (see LICENSE). */
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { createMemoryStateStore, runWithFallback } from "./fallbackRunner.js";
+import { classifyProviderFailure } from "./providerErrors.js";
 import {
     OPENCODE_ZEN_ENDPOINT, normalizeZenModel, isZenChatModel, isZenFreeModel,
     zenChatModels, pickZenFreeModel, validateZenModel,
@@ -60,24 +62,21 @@ const source = readFileSync(new URL("./main.jsx", import.meta.url), "utf8");
 const adapterSource = source.slice(source.indexOf("export async function discoverOpenCodeZenModels("), source.indexOf("async function callOpenAICompatible("))
     .replace("export async function", "async function");
 
-function adapter({ model = "", taskModel = "", apiKey = "test-only-key", allowPaid = "", customParams = "", local = true, fetchError, data = catalogue, status = 200 } = {}) {
+function adapter({ model = "", apiKey = "test-only-key", allowPaid = false, customParams = "", local = true, fetchError, data = catalogue, status = 200 } = {}) {
     const requests = [];
     const calls = [];
     const recent = [];
     const dependencies = {
         OPENCODE_ZEN_ENDPOINT, pickZenFreeModel, validateZenModel, zenChatModels,
+        classifyProviderFailure,
         PAGE_IS_LOCAL: local,
         providerFetch: async (url, options) => {
             requests.push({ url, options });
             if (fetchError) throw fetchError;
             return new Response(JSON.stringify(data), { status, headers: { "Content-Type": "application/json" } });
         },
-        getProviderSettings: (provider) => {
-            assert.equal(provider, "opencode-zen");
-            return { apiKey, customParams, structuredMode: "json_object" };
-        },
-        getProviderField: (provider, field) => { assert.equal(provider, "opencode-zen"); assert.equal(field, "allowPaid"); return allowPaid; },
-        getModelForTask: (provider, task) => { assert.equal(provider, "opencode-zen"); return task === "advisor" && taskModel ? taskModel : model; },
+        providerFailureError: (message, failure) => Object.assign(new Error(message), { providerFailure: failure }),
+        missingSetupError: (message, reason) => Object.assign(new Error(message), { providerFailure: { kind: "unusable", reason } }),
         parseCustomParams: (raw) => raw ? JSON.parse(raw) : {},
         saveRecentModel: (provider, id) => recent.push({ provider, id }),
         callOpenAIStyleChatCompletions: async (options) => { calls.push(options); return "answer"; },
@@ -85,7 +84,10 @@ function adapter({ model = "", taskModel = "", apiKey = "test-only-key", allowPa
         extractErrorMessage: (payload, fallback) => payload.error?.message ?? fallback,
     };
     const functions = new Function(...Object.keys(dependencies), `${adapterSource}\nreturn { callOpenCodeZen, discoverOpenCodeZenModels, zenFetch };`)(...Object.values(dependencies));
-    return { ...functions, calls, requests, recent };
+    const entrySettings = { id: "zen-entry", provider: "opencode-zen", model, apiKey, allowPaid, customParams, structuredMode: "json_object" };
+    return { ...functions, calls, requests, recent,
+        callOpenCodeZen: (system, history, opts = {}) => functions.callOpenCodeZen(system, history, { entrySettings, ...opts }),
+    };
 }
 
 test("Zen dispatch, key, fixed endpoint and shared streaming/tool transport", async () => {
@@ -107,7 +109,7 @@ test("Zen dispatch, key, fixed endpoint and shared streaming/tool transport", as
     assert.equal(call.onChunk, onChunk);
     assert.equal(call.allowJsonSchemaFallback, true);
     assert.equal(call.configuredStructuredMode, "json_object");
-    assert.equal(call.observerKey, "opencode-zen|mimo-v2.5-free");
+    assert.equal(call.observerKey, "zen-entry");
     // Pin the wiring as well as the adapter: normal callAI dispatch must reach it.
     assert.match(source, /case "opencode-zen":\s*return callOpenCodeZen\(systemPrompt, history, providerOpts\)/);
 });
@@ -119,24 +121,23 @@ test("discovery sends no key and blank model only uses the public free catalogue
     assert.equal(a.requests[0].options.method, "GET");
     assert.equal(a.requests[0].options.headers, undefined);
     assert.equal(a.calls[0].model, "big-pickle");
-    const paidOnly = adapter({ data: { data: [{ id: "deepseek-v4-flash" }] }, allowPaid: "1" });
+    const paidOnly = adapter({ data: { data: [{ id: "deepseek-v4-flash" }] }, allowPaid: true });
     await assert.rejects(paidOnly.callOpenCodeZen("system", []), /No supported free/);
     assert.equal(paidOnly.calls.length, 0);
 });
 
-test("missing key, task overrides and custom JSON cannot bypass paid opt-in", async () => {
+test("missing key, entry models and custom JSON cannot bypass paid opt-in", async () => {
     const missing = adapter({ apiKey: " " });
-    await assert.rejects(missing.callOpenCodeZen("s", []), /create and paste/);
+    await assert.rejects(missing.callOpenCodeZen("s", []), (error) => /create and paste/.test(error.message) && error.providerFailure.kind === "unusable");
     assert.equal(missing.requests.length, 0);
     for (const options of [
         { model: "deepseek-v4-flash" },
-        { model: "big-pickle", taskModel: "deepseek-v4-flash" },
         { model: "big-pickle", customParams: '{"model":"deepseek-v4-flash"}' },
     ]) {
         const blocked = adapter(options);
-        await assert.rejects(blocked.callOpenCodeZen("s", [], { taskKey: "advisor" }), /Paid.*disabled/);
+        await assert.rejects(blocked.callOpenCodeZen("s", [], { taskKey: "advisor" }), (error) => /Paid.*disabled/.test(error.message) && error.providerFailure.kind === "unusable");
         assert.equal(blocked.calls.length, 0);
-        const allowed = adapter({ ...options, allowPaid: "1" });
+        const allowed = adapter({ ...options, allowPaid: true });
         await allowed.callOpenCodeZen("s", [], { taskKey: "advisor" });
         assert.equal(allowed.calls[0].model, "deepseek-v4-flash");
         assert.equal(allowed.calls[0].customParams.model, undefined);
@@ -145,7 +146,7 @@ test("missing key, task overrides and custom JSON cannot bypass paid opt-in", as
 
 test("Zen fetch errors explain CORS on hosted pages and preserve cancellation/HTTP errors", async () => {
     const cors = adapter({ local: false, fetchError: new TypeError("Failed to fetch") });
-    await assert.rejects(cors.discoverOpenCodeZenModels(), /CORS.*desktop/);
+    await assert.rejects(cors.discoverOpenCodeZenModels(), (error) => /CORS.*desktop/.test(error.message) && error.providerFailure.kind === "busy");
     const local = adapter({ fetchError: new TypeError("offline") });
     await assert.rejects(local.discoverOpenCodeZenModels(), /offline/);
     const controller = new AbortController();
@@ -158,4 +159,43 @@ test("Zen fetch errors explain CORS on hosted pages and preserve cancellation/HT
     const explicitModel = adapter({ model: "big-pickle", local: false, fetchError: new TypeError("Failed to fetch") });
     await explicitModel.callOpenCodeZen("s", []);
     await assert.rejects(explicitModel.calls[0].fetchRequest(`${OPENCODE_ZEN_ENDPOINT}/chat/completions`, {}), /CORS.*desktop/);
+});
+
+test("fallback task picks use each Zen connection's key, billing opt-in and observer id", async () => {
+    const a = adapter();
+    const entries = [
+        { id: "paid-task", provider: "opencode-zen", label: "Paid task", model: "deepseek-v4-flash", apiKey: "first-key", allowPaid: false, customParams: "", structuredMode: "auto" },
+        { id: "free-backup", provider: "opencode-zen", label: "Free backup", model: "big-pickle", apiKey: "second-key", allowPaid: false, customParams: "", structuredMode: "json_object" },
+    ];
+    const store = createMemoryStateStore();
+    const attempt = (entrySettings, context) => a.callOpenCodeZen("s", [], { entrySettings, ...context, taskKey: "advisor" });
+    const outcome = await runWithFallback({ entries: [entries[1], entries[0]], store, attempt, now: () => 0, preferredEntryId: "paid-task" });
+    assert.equal(outcome.entry.id, "free-backup");
+    assert.equal(a.calls.length, 1, "the blocked paid entry sends no generation request");
+    assert.equal(a.calls[0].headers.Authorization, "Bearer second-key");
+    assert.equal(a.calls[0].observerKey, "free-backup");
+    assert.equal(a.calls[0].configuredStructuredMode, "json_object");
+    assert.match(store.get("paid-task").unusable, /Paid.*disabled/);
+    entries[0].allowPaid = true;
+    const allowed = await runWithFallback({ entries, store: createMemoryStateStore(), attempt, now: () => 0 });
+    assert.equal(allowed.entry.id, "paid-task");
+    assert.equal(a.calls[1].headers.Authorization, "Bearer first-key");
+    assert.equal(a.calls[1].observerKey, "paid-task");
+});
+
+test("catalogue outages and an empty free catalogue allow configured backups without paid discovery", async () => {
+    for (const options of [
+        { status: 503, data: { error: { message: "Zen unavailable" } } },
+        { data: { data: [{ id: "deepseek-v4-flash" }] }, allowPaid: true },
+    ]) {
+        const a = adapter(options);
+        const outcome = await runWithFallback({
+            entries: [{ id: "zen", provider: "opencode-zen" }, { id: "backup", provider: "gemini" }],
+            store: createMemoryStateStore(),
+            now: () => 0,
+            attempt: (entry) => entry.id === "zen" ? a.callOpenCodeZen("s", []) : "backup answer",
+        });
+        assert.equal(outcome.result, "backup answer");
+        assert.equal(a.calls.length, 0);
+    }
 });

@@ -1,16 +1,24 @@
-/*! Open Historia — portions (era diplomacy + mobile panel sizing) © 2026 Nicholas Krol, MIT (see src/Editor/LICENSE). */
+/*! Open Historia — portions (era diplomacy + mobile panel sizing) © 2026 Nicholas Krol, AGPL-3.0-or-later (see LICENSE). */
 import React, { memo, useEffect, useMemo, useRef, useState } from "react";
 import { dedupeByName } from "../../runtime/countryList.js";
 import ReactDOM from "react-dom";
 import { sendDiplomaticMessage, startDiplomaticChat, loadDiplomaticHistory } from "../AI/main.jsx";
-import { chooseNextDiplomaticSpeaker, isChatGenerationLikely, processPendingEventOutreach } from "../AI/gameplay.js";
+import { chooseNextDiplomaticSpeaker, ensureCountryAssessed, processPendingEventOutreach, runChatActionBatch } from "../AI/gameplayLazy.js";
+import { eventsFromLegacyChat, projectChatThread } from "../../runtime/chatThreads.js";
+import { CHAT_REVEAL_PAUSE_MS, describeChatCutIn, planChatReveal } from "../AI/chatActions.js";
+import { logForNextStep, startChatReveal } from "./chatReveal.js";
+import { campaignChanged } from "../../runtime/campaignGuard.js";
+import { isChatGenerationLikely } from "../AI/simulationStatus.js";
 import {
     MAX_ACTIVE_SPIES, activeSpies, deploySpy, expelSpy, foreignSpies, intelligenceOf, normalizeIntercepts, normalizeSpies,
     recallSpy, redactExchange, setCoverStory, signalClarity, turnSpy,
 } from "../../runtime/spycraft.js";
 import { isSeal, newSeal, openExchange } from "../../runtime/spySeal.js";
+import { useActiveFeatures } from "../../runtime/gameFeatures.js";
 import { Actions } from "./actions";
 import { Projects } from "./projects";
+import { DOCK_BOTTOM_REM, DOCK_GAP_REM, DOCK_HEIGHT_REM, DOCK_LEFT_REM, DOCK_WIDTH } from "./hudDock.js";
+import { isDocumentExchange } from "../../runtime/reportDelivery.js";
 import { Presence } from "./presence.jsx";
 import { useMainMenuOpen } from "./libraryBar";
 import {
@@ -25,9 +33,21 @@ import { resolvePolityFlag } from "../../runtime/polityFlags.js";
 import { fetchCommunityFlags, loadCommunityFlagDataUrl } from "../../runtime/communityFlags.js";
 import { logDebugEvent } from "../../runtime/debugLog.js";
 import { getLibraryState } from "../../runtime/library.js";
-import { readChatsState, writeChatsState, readInterceptsState, readWorldState, readWorldStateView, writeWorldState, applyProjectOpsToWorld } from "../../runtime/gameState.js";
+import { readChatsState, writeChatsState, readWorldState, readWorldStateView, writeWorldState, applyProjectOpsToWorld, viewAsSeen } from "../../runtime/gameState.js";
+import { buildThreadCatchUp } from "../AI/conversationCatchUp.js";
 import { spyOperationOps } from "../../runtime/projects.js";
 import Markdown, { MarkdownStyleInjector } from "./markdown.jsx";
+import { compareGameDates, formatGameDateReadable, normalizeGameDate, parseGameDate } from "../../runtime/gameDates.js";
+import { refreshRuntimeState, subscribeRuntime } from "../../runtime/runtimeStore.js";
+import { useRuntimeState } from "../../runtime/useRuntimeState.js";
+import { UNSEEN_EVENTS_CHANGED, withoutUnseenChats, withoutUnseenIntercepts, withoutUnseenMessages } from "../../runtime/unseenEvents.js";
+import { unseenEventIdsFor, useUnseenEventIds } from "./useUnseenEvents.js";
+
+// Who the player is and when it is: all this panel reads of game.json.
+const selectGameIdentity = (game) => ({
+    country: game?.country || "",
+    gameDate: game?.gameDate || "",
+});
 
 // ── Storage ───────────────────────────────────────────────────────────────────
 
@@ -37,10 +57,75 @@ const saveAllChats = async (chats) => {
     } catch (err) { console.error("Failed to save chats:", err); }
 };
 
+// How far each leader has been shown of its other threads
+// (AI/crossChatKnowledge.js). Written straight to world state, merged rather
+// than replaced: a turn in one chat must not forget what another chat showed.
+const saveChatKnowledgeCursors = async (cursors) => {
+    try {
+        const world = await readWorldState({ force: true });
+        await writeWorldState({ ...world, chatKnowledgeCursors: { ...(world?.chatKnowledgeCursors ?? {}), ...cursors } });
+    } catch (err) { console.error("Failed to save what each leader has been shown:", err); }
+};
+
 const loadAllChats = async ({ force = false } = {}) => {
     try {
         return await readChatsState({ force });
     } catch { return []; }
+};
+
+// ── What a thread missed ──────────────────────────────────────────────────────
+
+// The moment the player is writing from: the events they have been shown and the
+// date of the last of them — while a skip is being revealed, the reveal's front
+// (gameState.js viewAsSeen). The player's line is dated there, so the thread's
+// next catch-up picks up what the rest of the reveal showed.
+const readSeenChatMoment = async (gameDate) => {
+    try {
+        const [events, world] = await Promise.all([
+            readJson(JSON_URLS.events, { defaultValue: [] }),
+            readJson(JSON_URLS.world, { defaultValue: {}, clone: false }),
+        ]);
+        const seen = await viewAsSeen({ world, events, game: { gameDate } });
+        return { events: seen.events, date: seen.game?.gameDate || gameDate || "" };
+    } catch {
+        return { events: [], date: gameDate || "" };
+    }
+};
+
+// The votes cast in this thread since an AI participant last spoke — the one
+// thing the thread's own log knows that the leaders were not there to see.
+const votesSinceLastTurn = (chat, player) => {
+    const log = Array.isArray(chat?.events) ? chat.events : [];
+    if (!log.length) return [];
+    const me = String(player ?? "").trim().toLowerCase();
+    const lastLeaderLine = log.reduce((at, entry, index) => (
+        entry?.kind === "message" && entry.by && entry.by.trim().toLowerCase() !== me ? index : at
+    ), -1);
+    const { polls } = projectChatThread(log);
+    return log.slice(lastLeaderLine + 1)
+        .filter((entry) => entry?.kind === "poll_vote_cast")
+        .map((entry) => {
+            const poll = polls.find((candidate) => candidate.id === entry.pollId);
+            const option = poll?.options.find((candidate) => candidate.id === entry.optionId);
+            return poll && option ? `${entry.by} voted "${option.label}" on "${poll.question}"` : "";
+        })
+        .filter(Boolean);
+};
+
+// What the world did since this thread last spoke (AI/conversationCatchUp.js):
+// nothing for a thread's first line, or when nothing moved and nobody voted.
+const buildLeaderCatchUp = (messages, chat, player, moment) => {
+    const previous = [...(Array.isArray(messages) ? messages : [])].reverse()
+        .find((msg) => (msg.role === "user" || msg.role === "leader") && msg.time);
+    if (!previous) return { text: "", label: "" };
+    return buildThreadCatchUp({
+        previousDate: previous.time,
+        currentDate: moment?.date || "",
+        events: moment?.events ?? [],
+        votesSince: votesSinceLastTurn(chat, player),
+        compareDates: compareGameDates,
+        formatDate: (value) => formatGameDateReadable(value) || value,
+    });
 };
 
 // ── PMTiles country loader ────────────────────────────────────────────────────
@@ -240,13 +325,13 @@ const useNationColor = (code) => {
 
 // ── ThinkingDots ──────────────────────────────────────────────────────────────
 
-const ThinkingDots = () => {
+const ThinkingDots = ({ label = "Thinking" }) => {
     const [dots, setDots] = useState(0);
     useEffect(() => {
         const iv = setInterval(() => setDots(d => (d + 1) % 4), 500);
         return () => clearInterval(iv);
     }, []);
-    return <span style={{ opacity: 0.6 }}>Thinking{".".repeat(dots)}&nbsp;</span>;
+    return <span style={{ opacity: 0.6 }}>{label}{".".repeat(dots)}&nbsp;</span>;
 };
 
 // Cycles 1-3 dots (never empty, unlike ThinkingDots' 0-3) — used where there's
@@ -313,6 +398,67 @@ const EnvelopeIcon = ({ filled }) => (
 
 // ── Message bubble ────────────────────────────────────────────────────────────
 
+// A binding vote in a conversation (AI/chatActions.js). The AI participants
+// vote in the same answer that opens one; the player casts their own, once.
+// A poll is a record, not a control panel: there is no closing it and no
+// changing a vote, because neither is a thing a government gets to do.
+const PollCard = ({ poll, playerCountry, onVote }) => {
+    const votes = poll?.votes ?? {};
+    const mine = Object.entries(votes).find(([voter]) => voter.toLowerCase() === String(playerCountry ?? "").toLowerCase())?.[1] ?? "";
+    const total = Object.keys(votes).length;
+    return (
+        <div style={{
+            background: "rgba(59,130,246,0.08)",
+            border: "1px solid rgba(96,165,250,0.30)",
+            borderRadius: "12px",
+            display: "flex",
+            flexDirection: "column",
+            gap: "0.45rem",
+            margin: "0.35rem 0",
+            padding: "0.7rem 0.85rem",
+        }}>
+            <span style={{ fontSize: "0.68rem", letterSpacing: "0.04em", color: "rgba(147,197,253,0.9)", textTransform: "uppercase" }}>
+                Vote{poll?.openedBy ? ` · called by ${poll.openedBy}` : ""}
+            </span>
+            <span style={{ fontSize: "0.85rem", fontWeight: 700, lineHeight: 1.35 }}>{poll?.question}</span>
+            {(poll?.tally ?? []).map((option) => {
+                const chosen = mine === option.id;
+                const share = total ? Math.round((option.votes / total) * 100) : 0;
+                const voters = Object.entries(votes).filter(([, id]) => id === option.id).map(([voter]) => voter);
+                return (
+                    <button
+                        key={option.id}
+                        type="button"
+                        disabled={Boolean(mine)}
+                        onClick={() => onVote?.(option.id)}
+                        title={voters.length ? voters.join(", ") : "No vote yet"}
+                        style={{
+                            background: `linear-gradient(to right, rgba(96,165,250,0.28) ${share}%, rgba(255,255,255,0.05) ${share}%)`,
+                            border: chosen ? "1px solid rgba(96,165,250,0.85)" : "1px solid rgba(255,255,255,0.12)",
+                            borderRadius: "8px",
+                            color: "white",
+                            cursor: mine ? "default" : "pointer",
+                            display: "flex",
+                            fontFamily: "inherit",
+                            fontSize: "0.78rem",
+                            justifyContent: "space-between",
+                            padding: "0.4rem 0.6rem",
+                            textAlign: "left",
+                        }}
+                    >
+                        <span>{option.label}{chosen ? " ✓" : ""}</span>
+                        <span data-no-translate style={{ color: "rgba(255,255,255,0.55)" }}>{option.votes}</span>
+                    </button>
+                );
+            })}
+            <span data-no-translate style={{ color: "rgba(255,255,255,0.4)", fontSize: "0.68rem" }}>
+                {total === 0 ? "Nobody has voted yet" : `${total} vote${total === 1 ? "" : "s"} cast`}
+                {mine ? "" : " · your vote is yours to cast"}
+            </span>
+        </div>
+    );
+};
+
 const MessageBubble = ({ msg, onRetry }) => {
     const isPlayer = msg.role === "user";
     const isError  = msg.role === "error";
@@ -338,6 +484,14 @@ const MessageBubble = ({ msg, onRetry }) => {
             }}>
             {isError ? "⚠️ Error" : <><FlagImg url={flagUrl} alt={msg.speaker} size="0.95em" />{msg.speaker}</>}
             </span>
+        )}
+
+        {/* What the leaders were told the world did since this thread last
+            spoke, sent with this line (AI/conversationCatchUp.js); hover for it. */}
+        {isPlayer && msg.catchUpLabel && (
+            <div title={msg.catchUp || ""} style={{ color: "rgba(255,255,255,0.42)", fontSize: "0.66rem", marginBottom: "0.25rem", textAlign: "right" }}>
+                ⏳ {msg.catchUpLabel}
+            </div>
         )}
 
         {isPlayer && reactions.length > 0 && (
@@ -385,7 +539,9 @@ const MessageBubble = ({ msg, onRetry }) => {
 
         {!isPlayer && msg.time && (
             <span style={{ fontSize: "0.65rem", color: "rgba(255,255,255,0.3)", marginTop: "0.25rem", display: "block" }}>
-            {new Date(msg.time).toLocaleDateString([], { year: "numeric", month: "short", day: "numeric" })}
+            {/* Through gameDates.js: new Date("2016-01-01") is UTC midnight, shown a
+                day early west of Greenwich (the separator above always did this). */}
+            {formatGameDateReadable(msg.time, "MMM D, YYYY") || msg.time}
             </span>
         )}
         </div>
@@ -458,17 +614,24 @@ const ReactionBubble = ({ country, emoji, flagUrl, code }) => {
     );
 };
 
-const TypingBubble = ({ speaker, code }) => {
+// `label`: "Thinking" while the request is out, "Typing" while a line of the
+// table's turn waits to be said.
+const TypingBubble = ({ speaker, code, hint = "", label = "Thinking" }) => {
     const flagUrl = useCountryFlagUrl({ code, name: speaker });
     return (
         <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-start" }}>
         <span style={{ display: "inline-flex", alignItems: "center", gap: "0.3rem", fontSize: "0.7rem", color: "rgba(255,255,255,0.4)", marginBottom: "0.25rem" }}><FlagImg url={flagUrl} alt={speaker} size="0.95em" /> {speaker}</span>
         <div style={{ padding: "0.6rem 0.85rem", borderRadius: "12px 12px 12px 4px", backgroundColor: "rgba(255,255,255,0.08)", fontSize: "0.85rem" }}>
-        <ThinkingDots />
+        <ThinkingDots label={label} />
         </div>
+        {hint && <span style={{ fontSize: "0.66rem", color: "rgba(255,255,255,0.32)", marginTop: "0.3rem" }}>{hint}</span>}
         </div>
     );
 };
+
+// The campaign in front of the player, for a write made seconds after the
+// turn that produced it (runtime/campaignGuard.js).
+const activeCampaignNow = () => String(getLibraryState()?.activeGameId ?? "").trim();
 
 // ── Country selector ──────────────────────────────────────────────────────────
 
@@ -601,7 +764,7 @@ const CountrySelectorModal = ({
 // 12rem at the default 16px root, matching the composer's max-height below.
 const COMPOSER_MAX_HEIGHT = 192;
 
-const ConversationView = ({ chat, playerCountry, gameDate, onDelete, onBack, onMessagesUpdate, unread = false, onToggleRead, draft = "", onDraftApplied }) => {
+const ConversationView = ({ chat, playerCountry, gameDate, onDelete, onBack, onMessagesUpdate, onThreadUpdate, unread = false, onToggleRead, draft = "", onDraftApplied }) => {
     // Two-step delete, matching the list row. Disarms on blur so a half-pressed
     // delete never sits waiting to catch a later click.
     const [confirmingDelete, setConfirmingDelete] = useState(false);
@@ -614,6 +777,10 @@ const ConversationView = ({ chat, playerCountry, gameDate, onDelete, onBack, onM
     const isGroup = countries.length > 1;
 
     const [messages, setMessages]               = useState(chat.messages ?? []);
+    // A letter an event of the skip being revealed delivered waits for the
+    // reveal to reach that event (runtime/unseenEvents.js) — on screen and in
+    // what the leader is sent. The stored thread keeps it all along.
+    const unseen = useUnseenEventIds();
     const [visibleMessageLimit, setVisibleMessageLimit] = useState(CHAT_INITIAL_RENDER_WINDOW);
     const [phase, setPhase]                     = useState("player");
     const [isLoading, setIsLoading]             = useState(false);
@@ -624,9 +791,24 @@ const ConversationView = ({ chat, playerCountry, gameDate, onDelete, onBack, onM
 
     const nextSpeakerIdx    = useRef(0);
     const lastPlayerMessage = useRef("");
+    // What the last batch got wrong, told to the next one (AI/chatActions.js
+    // describeChatActionFeedback). Kept on the view: it is about the exchange,
+    // not the saved thread.
+    const actionFeedbackRef = useRef("");
     const messagesEndRef    = useRef(null);
     const messagesRef       = useRef(chat.messages ?? []);
     const composerRef       = useRef(null);
+    // A group turn is said a line at a time (AI/chatActions.js planChatReveal):
+    // the first at once, each later one after its speaker has been seen typing.
+    // The lines still to come are held HERE, not in the thread, until they are
+    // shown — so a line the player cuts in on was never said, and nothing has
+    // to be taken back out of the saved thread. `typingNext` is who is typing.
+    const revealRef = useRef(null);
+    const [typingNext, setTypingNext] = useState(null);
+    // The thread as last rendered, for a line shown seconds after its turn: a
+    // vote the player cast in between is kept under it.
+    const chatRef = useRef(chat);
+    useEffect(() => { chatRef.current = chat; }, [chat]);
 
     useEffect(() => {
         countries.forEach(({ name, code }) => resolveFlagImageUrl({ code, name }));
@@ -683,21 +865,114 @@ const ConversationView = ({ chat, playerCountry, gameDate, onDelete, onBack, onM
         logDebugEvent("diplomacy",
             `Opened chat #${chat.id} with ${countries.map((country) => country.name).join(", ") || "(nobody)"} — ${saved.length} saved message(s).`,
             undefined, { verbose: true });
-        if (saved.length > 0) loadDiplomaticHistory(saved);
+        const shown = withoutUnseenMessages(saved, unseen);
+        if (shown.length > 0) loadDiplomaticHistory(shown);
         else startDiplomaticChat();
         setVisibleMessageLimit(CHAT_INITIAL_RENDER_WINDOW);
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [chat.id]);
 
+    // The reveal moved on while this thread was open: the leader is sent what
+    // the player can now see. Not mid-reply — that exchange is already under way.
+    const unseenKey = [...unseen].join("|");
+    const unseenKeyAtOpen = useRef(unseenKey);
+    useEffect(() => {
+        if (unseenKeyAtOpen.current === unseenKey || isLoading) return;
+        unseenKeyAtOpen.current = unseenKey;
+        const shown = withoutUnseenMessages(messagesRef.current, unseen);
+        if (shown.length > 0) loadDiplomaticHistory(shown);
+        else startDiplomaticChat();
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [unseenKey]);
+
         useEffect(() => {
             messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-        }, [messages, isLoading, phase]);
+        }, [messages, isLoading, phase, typingNext]);
 
         const pushMessages = (updated) => {
             messagesRef.current = updated;
             setMessages(updated);
             onMessagesUpdate(chat.id, updated);
         };
+
+        // The panel's copy of a thread's messages, from its log's projection.
+        const viewMessagesOf = (projected) => projected.messages.map((message) => ({
+            id: message.id,
+            role: message.role,
+            speaker: message.speaker,
+            code: message.code,
+            text: message.text,
+            time: message.time,
+            reactions: message.reactions,
+            ...(message.memorySummary ? { memorySummary: message.memorySummary } : {}),
+            ...(message.eventId ? { eventId: message.eventId } : {}),
+            ...(message.catchUp ? { catchUp: message.catchUp, catchUpLabel: message.catchUpLabel } : {}),
+        }));
+
+        // Adds a step of a group turn to its thread: the log, the roster, title
+        // and polls, and the panel's messages when that thread is on screen.
+        // Nothing is written once the player has switched campaign: the runtime
+        // files follow the open campaign, so a late write would land on the one
+        // switched to (runtime/campaignGuard.js).
+        const addTurnEvents = (reveal, newEvents, { cursors = null, onScreen = true } = {}) => {
+            if (campaignChanged(reveal.campaignId, activeCampaignNow())) return false;
+            const live = chatRef.current;
+            const events = [
+                ...logForNextStep({ turnLog: reveal.events, wroteAny: reveal.written, chatId: reveal.chatId, liveChatId: live?.id, liveLog: live?.events }),
+                ...newEvents,
+            ];
+            reveal.events = events;
+            reveal.written = true;
+            const projected = projectChatThread(events);
+            const shown = viewMessagesOf(projected);
+            if (onScreen && String(live?.id) === String(reveal.chatId)) pushMessages(shown);
+            else onMessagesUpdate(reveal.chatId, shown);
+            onThreadUpdate?.(reveal.chatId, { events, countries: projected.countries, title: projected.title, polls: projected.polls, ...(cursors ? { cursors } : {}) });
+            return true;
+        };
+
+        // The rest of a group turn, a line at a time (chatReveal.js): each
+        // speaker is seen typing for CHAT_REVEAL_PAUSE_MS, then says the line.
+        const sayLater = (reveal, steps) => {
+            revealRef.current = reveal;
+            reveal.controller = startChatReveal({
+                steps,
+                pauseMs: CHAT_REVEAL_PAUSE_MS,
+                onTyping: (step) => setTypingNext(step
+                    ? { speaker: step.speaker, code: countries.find((country) => (country.name || "").toLowerCase() === step.speaker.toLowerCase())?.code || "" }
+                    : null),
+                onSay: (step) => {
+                    if (addTurnEvents(reveal, step.events)) return true;
+                    logDebugEvent("diplomacy", `Chat #${reveal.chatId}: the campaign changed while the table was still talking; the rest of the turn was not written.`, undefined, { problem: true });
+                    return false;
+                },
+                onEnd: () => { if (revealRef.current === reveal) revealRef.current = null; },
+            });
+        };
+
+        // The player spoke while the table was still talking. What had not been
+        // said yet never is — the way Intervene discards the events a skip's
+        // reveal has not reached — and the next turn is told whose lines went
+        // unsaid (describeChatCutIn).
+        const cutIn = () => {
+            const reveal = revealRef.current;
+            const unsaid = reveal?.controller?.stop() ?? [];
+            if (!unsaid.length) return;
+            const note = describeChatCutIn({ player: playerCountry, steps: unsaid });
+            if (note) actionFeedbackRef.current = [actionFeedbackRef.current, note].filter(Boolean).join("\n\n");
+            logDebugEvent("diplomacy",
+                `${playerCountry || "The player"} cut in on chat #${reveal.chatId}: ${unsaid.length} line(s) of the table's turn were never said.`,
+                { unsaid: unsaid.map((step) => step.speaker) }, { verbose: true });
+        };
+
+        // Leaving the thread is not cutting in: what the table was still to say
+        // is said, all at once, into the thread it belongs to.
+        useEffect(() => () => {
+            const reveal = revealRef.current;
+            const rest = reveal?.controller?.stop() ?? [];
+            if (rest.length) addTurnEvents(reveal, rest.flatMap((step) => step.events), { onScreen: false });
+            // eslint-disable-next-line react-hooks/exhaustive-deps
+        }, [chat.id]);
 
         const isPlayerCountry = (country) => countryMatchesIdentity(country, playerCountry);
 
@@ -714,13 +989,18 @@ const ConversationView = ({ chat, playerCountry, gameDate, onDelete, onBack, onM
             }
             setIsLoading(true);
             setSpeakingCountry(country);
+            // The player's message as stored: the catch-up it was sent with
+            // (AI/conversationCatchUp.js), and the moment it was asked from — a
+            // reply is dated with its question. A retry finds the same one.
+            const asked = [...messagesRef.current].reverse().find((msg) => msg.role === "user" && msg.text === playerMessage);
+            const repliedOn = asked?.time || gameDate;
             try {
-                const { reply, reaction, memorySummary } = await sendDiplomaticMessage(playerMessage, country.name, countries);
+                const { reply, reaction, memorySummary } = await sendDiplomaticMessage(playerMessage, country.name, countries, { chatId: chat.id, catchUp: asked?.catchUp || "" });
                 // The thread's rolling durable memory rides on the reply that
                 // produced it, so a reopened thread, the advisor's one-off sends
                 // and the world director read the same continuity.
                 const leaderMessage = {
-                    role: "leader", speaker: country.name, code: country.code, text: reply, time: gameDate,
+                    role: "leader", speaker: country.name, code: country.code, text: reply, time: repliedOn,
                     ...(memorySummary ? { memorySummary } : {}),
                 };
 
@@ -739,7 +1019,7 @@ const ConversationView = ({ chat, playerCountry, gameDate, onDelete, onBack, onM
                 }
             } catch (err) {
                 pushMessages([...messagesRef.current, {
-                    role: "error", speaker: country.name, code: country.code, text: err.message, time: gameDate,
+                    role: "error", speaker: country.name, code: country.code, text: err.message, time: repliedOn,
                     // Everything handleRetry needs to re-issue this exact turn.
                     // Plain data so it survives a save/reload of the chat.
                     retry: {
@@ -810,13 +1090,93 @@ const ConversationView = ({ chat, playerCountry, gameDate, onDelete, onBack, onM
             setPhase("pending");
         };
 
+        // A GROUP turn in one request (AI/chatActions.js): every AI participant
+        // acts in a single answer — who speaks, who only reacts, who brings
+        // someone in, who calls a vote — instead of one request to pick the
+        // speaker and one per leader after it. A failure falls back to the
+        // rotation below, which is the behaviour this replaces.
+        const runGroupTurn = async (text, nextMessages) => {
+            setIsLoading(true);
+            // The player's line, with the catch-up it carries and its moment.
+            const asked = nextMessages.at(-1);
+            // The campaign this turn belongs to: nothing is written after a switch.
+            const campaignId = activeCampaignNow();
+            try {
+                const outcome = await runChatActionBatch({
+                    chat: { ...chat, messages: nextMessages, actionFeedback: actionFeedbackRef.current },
+                    playerMessage: text,
+                    playerCountry,
+                    catchUp: asked?.catchUp || "",
+                    time: asked?.time || "",
+                });
+                const newEvents = outcome?.newEvents ?? [];
+                if (!newEvents.length) return false;
+                actionFeedbackRef.current = outcome?.feedback ?? "";
+                // The first line is said now, the rest one at a time after it
+                // (planChatReveal). The projection carries the reactions, the
+                // roster and the polls each step changes; the panel renders
+                // messages, and the stored thread keeps the rest.
+                const [first, ...later] = planChatReveal(newEvents);
+                const reveal = {
+                    chatId: chat.id,
+                    campaignId,
+                    events: outcome.events.slice(0, outcome.events.length - newEvents.length),
+                    written: false,
+                    controller: null,
+                };
+                if (!addTurnEvents(reveal, first.events, { cursors: outcome.cursors })) {
+                    logDebugEvent("diplomacy", `Chat #${chat.id}: the campaign changed while the table was answering; nothing was written.`, undefined, { problem: true });
+                    return true;
+                }
+                if (later.length) sayLater(reveal, later);
+                setPhase("player");
+                return true;
+            } catch (error) {
+                logDebugEvent("diplomacy", `The one-request chat turn failed in chat #${chat.id}; falling back to the rotation.`, error, { problem: true });
+                return false;
+            } finally {
+                setIsLoading(false);
+                setSpeakingCountry(null);
+            }
+        };
+
+        // The player's own vote. Appended to the thread's log like any other
+        // event, and never cast for them by a model (chatActions.js refuses an
+        // action whose actor is human-controlled).
+        const handlePlayerVote = (poll, optionId) => {
+            if (!poll?.id || !optionId) return;
+            const already = Object.keys(poll.votes ?? {}).some((voter) => voter.toLowerCase() === String(playerCountry ?? "").toLowerCase());
+            if (already) return;
+            const events = [
+                ...(chat.events?.length ? chat.events : eventsFromLegacyChat({ ...chat, messages: messagesRef.current })),
+                { id: `vote-${poll.id}-${playerCountry}`, kind: "poll_vote_cast", time: gameDate, by: playerCountry, pollId: poll.id, optionId },
+            ];
+            const projected = projectChatThread(events);
+            onThreadUpdate?.(chat.id, { events, countries: projected.countries, title: projected.title, polls: projected.polls });
+            logDebugEvent("diplomacy", `${playerCountry} voted in chat #${chat.id}.`, { poll: poll.question, optionId }, { verbose: true });
+        };
+
         const handlePlayerSubmit = async () => {
             const text = playerInput.trim();
             if (!text || isLoading) return;
+            // Speaking while the table is still talking cuts it off.
+            cutIn();
             lastPlayerMessage.current = text;
-            const nextMessages = [...messagesRef.current, { role: "user", speaker: playerCountry, text, time: gameDate }];
-            pushMessages(nextMessages);
             setPlayerInput("");
+            // What the world did since this thread last spoke, told to the
+            // leaders with the player's line and kept on it (AI/conversationCatchUp.js
+            // buildThreadCatchUp), dated from the moment the player is looking at.
+            const moment = await readSeenChatMoment(gameDate);
+            const catchUp = buildLeaderCatchUp(messagesRef.current, chat, playerCountry, moment);
+            const nextMessages = [...messagesRef.current, {
+                role: "user", speaker: playerCountry, text, time: moment.date || gameDate,
+                ...(catchUp.text ? { catchUp: catchUp.text, catchUpLabel: catchUp.label } : {}),
+            }];
+            pushMessages(nextMessages);
+            // One request for the whole table. Only for a group: a one-on-one
+            // chat is already a single request, and its streaming reply is what
+            // the player watches arrive.
+            if (isGroup && await runGroupTurn(text, nextMessages)) return;
             const queue = await buildResponsiveQueue(nextMessages);
             // Who was asked, and in what order. A group chat sends the same
             // message to each leader in turn, so "France answered as if it had
@@ -872,10 +1232,15 @@ const ConversationView = ({ chat, playerCountry, gameDate, onDelete, onBack, onM
         };
 
         const typingSpeaker = speakingCountry ?? countries[0];
-        const visibleMessages = messages.length > visibleMessageLimit
-            ? messages.slice(messages.length - visibleMessageLimit)
-            : messages;
-        const hiddenMessageCount = messages.length - visibleMessages.length;
+        // What the reveal has reached, each with its place in the stored thread
+        // (a retry replays the stored message at that index).
+        const shownEntries = messages
+            .map((msg, index) => ({ msg, index }))
+            .filter(({ msg }) => !unseen.has(String(msg?.eventId ?? "")));
+        const visibleEntries = shownEntries.length > visibleMessageLimit
+            ? shownEntries.slice(shownEntries.length - visibleMessageLimit)
+            : shownEntries;
+        const hiddenMessageCount = shownEntries.length - visibleEntries.length;
 
         return (
             <>
@@ -939,10 +1304,9 @@ const ConversationView = ({ chat, playerCountry, gameDate, onDelete, onBack, onM
                 already been answered past, and re-running it would splice a
                 reply into the middle of the thread. A date separator opens
                 every new game day. */}
-            {visibleMessages.map((msg, i) => {
-                const index = hiddenMessageCount + i;
+            {visibleEntries.map(({ msg, index }, i) => {
                 const dateKey = chatDateKey(msg?.time);
-                const showDateSeparator = Boolean(dateKey) && (i === 0 || dateKey !== chatDateKey(visibleMessages[i - 1]?.time));
+                const showDateSeparator = Boolean(dateKey) && (i === 0 || dateKey !== chatDateKey(visibleEntries[i - 1]?.msg?.time));
                 return (
                     <React.Fragment key={index}>
                     {showDateSeparator && <ChatDateSeparator value={msg.time} />}
@@ -951,7 +1315,22 @@ const ConversationView = ({ chat, playerCountry, gameDate, onDelete, onBack, onM
                     </React.Fragment>
                 );
             })}
+            {/* Binding votes opened in this conversation (AI/chatActions.js).
+                The AI participants vote in the same answer that opens one; the
+                player votes here, and their vote is theirs alone to cast. */}
+            {(chat.polls ?? []).map((poll) => (
+                <PollCard
+                    key={poll.id}
+                    poll={poll}
+                    playerCountry={playerCountry}
+                    onVote={(optionId) => handlePlayerVote(poll, optionId)}
+                />
+            ))}
             {isLoading && typingSpeaker && <TypingBubble speaker={typingSpeaker.name} code={typingSpeaker.code} />}
+            {/* The next line of the table's turn, still being typed. */}
+            {!isLoading && typingNext && (
+                <TypingBubble speaker={typingNext.speaker} code={typingNext.code} label="Typing" hint="Send a message now to cut in: what is still to come will not be said." />
+            )}
             <div ref={messagesEndRef} />
             </div>
 
@@ -1014,19 +1393,21 @@ const CountryTurnLabel = ({ country, remaining }) => {
 const chatDateKey = (value) => {
     const raw = String(value ?? "").trim();
     if (!raw) return "";
-    const isoDay = raw.match(/^\d{4}-\d{2}-\d{2}/)?.[0];
-    return isoDay || raw;
+    return normalizeGameDate(raw) || raw;
 };
 
 const formatChatDateLabel = (value) => {
     const raw = String(value ?? "").trim();
     if (!raw) return "";
 
+    const parts = parseGameDate(raw);
+    // Years before 1000 (BC included) go through the game-date formatter: the
+    // locale formatter has no era unless asked and Date reads 0-99 as 1900+.
+    if (parts && parts.year < 1000) return formatGameDateReadable(raw, "MMMM D, YYYY");
     // Bare YYYY-MM-DD parses as UTC in browsers, which can shift a displayed day in
     // some time zones. Noon-local keeps an in-game calendar date exactly on that day.
-    const isoDay = raw.match(/^(\d{4})-(\d{2})-(\d{2})$/);
-    const parsed = isoDay
-        ? new Date(Number(isoDay[1]), Number(isoDay[2]) - 1, Number(isoDay[3]), 12, 0, 0)
+    const parsed = parts
+        ? new Date(parts.year, parts.month - 1, parts.day, 12, 0, 0)
         : new Date(raw);
 
     return Number.isNaN(parsed.getTime())
@@ -1494,19 +1875,23 @@ const InterceptView = ({ target, exchange, clarity, seal, onBack }) => {
 };
 
 const SpyView = ({ playerCountry, gameDate, countries, loadingCountries }) => {
-    const [world, setWorld]           = useState(null);
-    const [intercepts, setIntercepts] = useState({});
+    const world                       = useRuntimeState("world");
+    const filedIntercepts             = useRuntimeState("intercepts", normalizeIntercepts);
+    // A copy an agent stole in an event the reveal has not reached yet is not in
+    // the file the player is shown (runtime/unseenEvents.js).
+    const unseen                      = useUnseenEventIds();
+    const intercepts                  = useMemo(() => withoutUnseenIntercepts(filedIntercepts, unseen), [filedIntercepts, unseen]);
     const [open, setOpen]             = useState(null); // { target, exchange }
     const [choosing, setChoosing]     = useState(false);
     const [error, setError]           = useState("");
 
-    const refresh = async () => {
-        try {
-            const [w, i] = await Promise.all([readWorldState({ force: true }), readInterceptsState({ force: true })]);
-            setWorld(w); setIntercepts(normalizeIntercepts(i));
-        } catch { /* keep what we have */ }
-    };
-    useEffect(() => { refresh(); const iv = setInterval(refresh, 5000); return () => clearInterval(iv); }, []);
+    // Opening the tab is when these have to be current; the store does the rest.
+    useEffect(() => { void refreshRuntimeState(["world", "intercepts"]); }, []);
+    // Opening the tab is the first time most players meet their own service, and
+    // sending an agent the first time they meet another's: each gets its stat
+    // sheet and a first intelligence reading then (gameplay.js ensureCountryAssessed)
+    // instead of every service sitting on the same "ordinary" default.
+    useEffect(() => { void ensureCountryAssessed(playerCountry, { reason: "spies tab" }); }, [playerCountry]);
 
     const myIntel = intelligenceOf(world, playerCountry);
     // Pre-ownership records (no owner) were all the player's.
@@ -1514,6 +1899,10 @@ const SpyView = ({ playerCountry, gameDate, countries, loadingCountries }) => {
     const foreign = foreignSpies(world, playerCountry);
     const history = normalizeSpies(world?.spies).filter((spy) => (!spy.owner || spy.owner === playerCountry) && spy.status === "exposed").slice(-3);
     const [storyDraft, setStoryDraft] = useState({}); // spy id -> cover story being typed
+    // Which agent's story was just saved: the Save button reads "Saved" for a
+    // moment. Without it a save changed nothing on screen — the field already
+    // showed what was typed — and read as a button that does nothing.
+    const [savedFlash, setSavedFlash] = useState("");
 
     const commitSpies = async (next) => {
         // Re-read at write time so a jump's world write is never clobbered with
@@ -1535,21 +1924,25 @@ const SpyView = ({ playerCountry, gameDate, countries, loadingCountries }) => {
                 world: committed,
             }).world
             : committed;
+        // Canonical, so the store republishes the saved world to this view.
         await writeWorldState(toWrite);
-        await refresh();
     };
 
     const handleExpel = async (spy) => {
         setError("");
-        try { await commitSpies(expelSpy(world, spy.id, { date: gameDate })); } catch (err) { setError(err?.message || String(err)); }
+        try { await commitSpies(expelSpy(world, spy.id, { date: gameDate })); void ensureCountryAssessed(spy.owner, { reason: "foreign agent expelled" }); } catch (err) { setError(err?.message || String(err)); }
     };
     const handleTurn = async (spy) => {
         setError("");
-        try { await commitSpies(turnSpy(world, spy.id, { date: gameDate, coverStory: storyDraft[spy.id] || "" })); } catch (err) { setError(err?.message || String(err)); }
+        try { await commitSpies(turnSpy(world, spy.id, { date: gameDate, coverStory: storyDraft[spy.id] || "" })); void ensureCountryAssessed(spy.owner, { reason: "foreign agent turned" }); } catch (err) { setError(err?.message || String(err)); }
     };
     const handleStory = async (spy) => {
         setError("");
-        try { await commitSpies(setCoverStory(world, spy.id, storyDraft[spy.id] ?? spy.coverStory)); } catch (err) { setError(err?.message || String(err)); }
+        try {
+            await commitSpies(setCoverStory(world, spy.id, storyDraft[spy.id] ?? spy.coverStory));
+            setSavedFlash(spy.id);
+            setTimeout(() => setSavedFlash((current) => (current === spy.id ? "" : current)), 1800);
+        } catch (err) { setError(err?.message || String(err)); }
     };
 
     const handleDeploy = async (selected) => {
@@ -1558,6 +1951,7 @@ const SpyView = ({ playerCountry, gameDate, countries, loadingCountries }) => {
         try {
             const next = deploySpy(world, target, { date: gameDate, playerPolity: playerCountry });
             await commitSpies(next);
+            void ensureCountryAssessed(target, { reason: "agent deployed" });
         } catch (err) { setError(err?.message || String(err)); }
     };
 
@@ -1641,13 +2035,29 @@ const SpyView = ({ playerCountry, gameDate, countries, loadingCountries }) => {
             </div>
             </div>
             {spy.status === "discovered" && <button onClick={() => handleExpel(spy)} style={spyBtn(false)}>Expel</button>}
-            {spy.status === "discovered" && <button onClick={() => handleTurn(spy)} style={spyBtn(true)}>Turn</button>}
+            {spy.status === "discovered" && (
+                <button onClick={() => handleTurn(spy)} style={spyBtn(true)} title={storyOf(spy) ? "Turn this agent and plant the story below as what it reports home" : "Turn this agent into a double agent; you can plant a story afterwards"}>
+                    {storyOf(spy) ? "Turn & plant story" : "Turn"}
+                </button>
+            )}
             </div>
             {spy.status !== "exposed" && (
                 <div style={{ marginTop: "0.5rem", display: "flex", gap: "0.4rem", alignItems: "center" }}>
-                <input value={storyOf(spy)} onChange={(e) => setStoryDraft((d) => ({ ...d, [spy.id]: e.target.value }))} placeholder={spy.status === "discovered" ? "Cover story to feed them if turned (optional)" : "What your double agent tells " + spy.owner}
+                <input value={storyOf(spy)} onChange={(e) => setStoryDraft((d) => ({ ...d, [spy.id]: e.target.value }))} onKeyDown={(e) => { if (e.key === "Enter" && spy.status === "turned") { e.preventDefault(); handleStory(spy); } }} placeholder={spy.status === "discovered" ? "Cover story to feed them if turned (optional)" : "What your double agent tells " + spy.owner}
                     style={inputStyle} />
-                {spy.status === "turned" && <button onClick={() => handleStory(spy)} style={spyBtn(true)}>Save</button>}
+                {spy.status === "turned" && (() => {
+                    // Nothing to save once the field matches what the agent already
+                    // reports; the button shows it rather than doing nothing.
+                    const unchanged = storyOf(spy) === spy.coverStory;
+                    const justSaved = savedFlash === spy.id;
+                    return (
+                        <button onClick={() => handleStory(spy)} disabled={unchanged && !justSaved}
+                            style={{ ...spyBtn(true), ...(unchanged && !justSaved ? { opacity: 0.45, cursor: "default" } : {}) }}
+                            title={justSaved ? "Saved — this is what the agent now reports home" : unchanged ? "The agent already reports this story" : "Save the story the agent reports home (Enter does the same)"}>
+                            {justSaved ? "Saved ✓" : "Save"}
+                        </button>
+                    );
+                })()}
                 </div>
             )}
             </div>
@@ -1659,9 +2069,10 @@ const SpyView = ({ playerCountry, gameDate, countries, loadingCountries }) => {
             <div style={{ fontSize: "0.66rem", letterSpacing: "0.08em", textTransform: "uppercase", color: "rgba(255,255,255,0.4)", marginTop: "0.4rem" }}>Intercepts</div>
         )}
         {targets.map((target) => intercepts[target].exchanges.map((exchange) => (
-            <button key={exchange.id} onClick={() => setOpen({ target, exchange })}
+            <button key={exchange.id} onClick={() => { setOpen({ target, exchange }); void ensureCountryAssessed(target, { reason: "intercept read" }); }}
                 style={{ width: "100%", padding: "0.6rem 0.8rem", borderRadius: "10px", border: "1px solid rgba(255,255,255,0.07)", background: "rgba(255,255,255,0.03)", display: "flex", alignItems: "center", gap: "0.6rem", cursor: "pointer", fontFamily: "sans-serif", textAlign: "left", color: "white" }}>
-            <span aria-hidden="true" style={{ fontSize: "1rem" }}>📡</span>
+            {/* A stolen document (runtime/reportDelivery.js) beside the agent's traffic. */}
+            <span aria-hidden="true" style={{ fontSize: "1rem" }}>{isDocumentExchange(exchange) ? "📄" : "📡"}</span>
             <span style={{ flex: 1, minWidth: 0 }}>
             <span style={{ display: "block", fontSize: "0.82rem", fontWeight: 600, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{target} ↔ {exchange.counterpart}</span>
             <span style={{ display: "block", fontSize: "0.68rem", color: "rgba(255,255,255,0.5)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{exchange.subject}{exchange.date ? " · " + exchange.date : ""}</span>
@@ -1682,6 +2093,10 @@ const SpyView = ({ playerCountry, gameDate, countries, loadingCountries }) => {
 const ChatPanel = ({ isOpen, onClose, requestedCountry, requestedDraft = "", onConsumeRequest, requestedChatId = "", onConsumeRequestedChat, isGenerating = false }) => {
     // "chats" is the diplomacy the player is party to; "spy" is everyone else's.
     const [view, setView] = useState("chats");
+    // The Spy tab exists only where espionage does (the scenario's Features tab,
+    // or this game's own override); a view left on it shows the diplomacy list.
+    const espionageOn = useActiveFeatures().espionage?.enabled !== false;
+    const currentView = espionageOn ? view : "chats";
     const [countries, setCountries]               = useState([]);
     const [loadingCountries, setLoadingCountries] = useState(true);
     const [playerCountry, setPlayerCountry]       = useState("your nation");
@@ -1693,7 +2108,14 @@ const ChatPanel = ({ isOpen, onClose, requestedCountry, requestedDraft = "", onC
     // mount. Tied to a chat id so navigating to a DIFFERENT chat never inherits it.
     const [composerDraft, setComposerDraft]       = useState(null);
     const [hasLoadedInitialData, setHasLoadedInitialData] = useState(false);
-    const openChats = chats.filter((chat) => chat.status !== "closed" && Array.isArray(chat.countries) && chat.countries.length > 0);
+    // The threads as the player has been shown them (runtime/unseenEvents.js): a
+    // thread an unseen event opened, or a letter one delivered, arrives when the
+    // reveal reaches that event — and only then counts as unread. Only for
+    // showing: every write below writes `chats`, the stored threads.
+    const unseen = useUnseenEventIds();
+    const shownChats = useMemo(() => withoutUnseenChats(chats, unseen), [chats, unseen]);
+    const shownVersion = (chat) => (chat ? withoutUnseenChats([chat], unseen)[0] ?? chat : chat);
+    const openChats = shownChats.filter((chat) => chat.status !== "closed" && Array.isArray(chat.countries) && chat.countries.length > 0);
 
     // Which chats to flag as unread: seeded from the persisted baseline when the
     // panel OPENS, then only ever added to (arrivals) or cleared per-chat (an
@@ -1819,8 +2241,10 @@ const ChatPanel = ({ isOpen, onClose, requestedCountry, requestedDraft = "", onC
     // stays the active chat, so messages that arrive WHILE the player is looking
     // at it (an incoming reply, a background poll merge) don't get left stranded
     // above the last-seen baseline and resurface as unread on the next visit.
+    // The list row is the thread as shown; the conversation gets the stored one,
+    // which is what it writes back.
     const openChatFromList = (chat) => {
-        setActiveChat(chat);
+        setActiveChat(chats.find((entry) => entry.id === chat.id) ?? chat);
         setHeldUnreadId(null);
         setChatReadState(chat, true);
     };
@@ -1830,15 +2254,18 @@ const ChatPanel = ({ isOpen, onClose, requestedCountry, requestedDraft = "", onC
     const toggleActiveChatRead = (chat) => {
         const wasUnread = unreadIds.has(String(chat.id));
         setHeldUnreadId(wasUnread ? null : String(chat.id));
-        setChatReadState(chat, wasUnread);
+        setChatReadState(shownVersion(chat), wasUnread);
     };
 
+    // Read as far as it is shown: a letter still waiting on the reveal is not
+    // read yet, and marks the thread new when it arrives.
+    const shownActiveCount = shownVersion(activeChat)?.messages?.length ?? 0;
     useEffect(() => {
         if (!activeChat) return;
         if (heldUnreadId === String(activeChat.id)) return;
-        setChatReadState(activeChat, true);
+        setChatReadState(shownVersion(activeChat), true);
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [activeChat?.id, activeChat?.messages?.length, heldUnreadId]);
+    }, [activeChat?.id, shownActiveCount, heldUnreadId]);
 
     // Leaving a chat ends the hold — the next visit is an ordinary read.
     useEffect(() => {
@@ -1867,37 +2294,23 @@ const ChatPanel = ({ isOpen, onClose, requestedCountry, requestedDraft = "", onC
         return () => { cancelled = true; };
     }, [hasLoadedInitialData, isOpen]);
 
+    const identity = useRuntimeState("game", selectGameIdentity);
     useEffect(() => {
         if (!isOpen) return;
-
-        let cancelled = false;
-        const go = () => readJson(JSON_URLS.game, { defaultValue: {}, force: true })
-        .then((data) => {
-            if (cancelled) return;
-            if (data.country) setPlayerCountry(data.country);
-            if (data.gameDate) setGameDate(data.gameDate);
-        })
-        .catch(() => {});
-
-        go();
-        const iv = setInterval(go, 5000);
-        return () => {
-            cancelled = true;
-            clearInterval(iv);
-        };
-    }, [isOpen]);
+        if (identity.country) setPlayerCountry(identity.country);
+        if (identity.gameDate) setGameDate(identity.gameDate);
+    }, [isOpen, identity]);
 
     // Chats created OUTSIDE this panel — a jump's diplomatic invitations, the
     // idle outreach drip — used to be invisible until a full page reload (the
-    // list loaded exactly once). Poll the stored list while the panel is open
-    // and merge additions/updates in; the active conversation object is left
-    // alone so an in-flight exchange is never clobbered mid-reply.
+    // list loaded exactly once). The store publishes the stored list while the
+    // panel is open and additions are merged in; the active conversation object
+    // is left alone so an in-flight exchange is never clobbered mid-reply.
     useEffect(() => {
         if (!isOpen || !hasLoadedInitialData) return;
 
         let cancelled = false;
-        const sync = () => loadAllChats({ force: true })
-        .then((saved) => {
+        const sync = (saved) => {
             if (cancelled) return;
             if (!Array.isArray(saved)) { setFreshSinceOpen(true); return; }
             setChats((prev) => {
@@ -1915,19 +2328,15 @@ const ChatPanel = ({ isOpen, onClose, requestedCountry, requestedDraft = "", onC
             // Batched with the setChats above, so the snapshot effect first runs
             // against the list this read produced, never the one it replaced.
             setFreshSinceOpen(true);
-        })
-        // A failed read must not wedge the panel on "waiting for fresh data" —
-        // fall back to whatever is in hand and let the next tick try again.
-        .catch(() => { if (!cancelled) setFreshSinceOpen(true); });
+        };
 
-        // Run now, not in 5s: opening the panel is exactly the moment the list
-        // has to be current, and a player who opens and closes inside the
-        // interval would otherwise never see a read at all.
-        sync();
-        const iv = setInterval(sync, 5000);
+        const unsubscribe = subscribeRuntime("chat", sync);
+        // Opening the panel is when the list has to be current, and a failed
+        // read must not wedge it on "waiting for fresh data".
+        refreshRuntimeState(["chat"]).finally(() => { if (!cancelled) setFreshSinceOpen(true); });
         return () => {
             cancelled = true;
-            clearInterval(iv);
+            unsubscribe();
         };
     }, [isOpen, hasLoadedInitialData]);
 
@@ -1944,6 +2353,22 @@ const ChatPanel = ({ isOpen, onClose, requestedCountry, requestedDraft = "", onC
             setActiveChat(ac => ac?.id === chatId ? { ...ac, messages: newMessages } : ac);
             return updated;
         });
+    };
+
+    // What the one-request turn changed beyond the messages: the event log
+    // itself (the truth of the thread), the roster after a join or a departure,
+    // the title, the polls, and each speaker's cross-chat cursors. The cursors
+    // live in world state, so they are written there rather than on the chat.
+    const handleThreadUpdate = (chatId, { events, countries, title, polls, cursors }) => {
+        setChats((prev) => {
+            const updated = prev.map((c) => (c.id === chatId
+                ? { ...c, events, countries: countries ?? c.countries, title: title || c.title, polls: polls ?? c.polls }
+                : c));
+            saveAllChats(updated);
+            setActiveChat((ac) => (ac?.id === chatId ? updated.find((c) => c.id === chatId) ?? ac : ac));
+            return updated;
+        });
+        if (cursors && Object.keys(cursors).length) void saveChatKnowledgeCursors(cursors);
     };
 
     const handleStartChat = (selected) => {
@@ -2044,7 +2469,7 @@ const ChatPanel = ({ isOpen, onClose, requestedCountry, requestedDraft = "", onC
             <Presence open={showSelector}><CountrySelectorModal countries={availableCountries} loading={loadingCountries} onStart={handleStartChat} onCancel={() => setShowSelector(false)} /></Presence>
 
             {activeChat && Array.isArray(activeChat.countries) && activeChat.countries.length > 0 ? (
-                <ConversationView chat={activeChat} playerCountry={playerCountry} gameDate={gameDate} onDelete={() => handleDeleteChat(activeChat.id)} onBack={() => setActiveChat(null)} onMessagesUpdate={handleMessagesUpdate}
+                <ConversationView chat={activeChat} playerCountry={playerCountry} gameDate={gameDate} onDelete={() => handleDeleteChat(activeChat.id)} onBack={() => setActiveChat(null)} onMessagesUpdate={handleMessagesUpdate} onThreadUpdate={handleThreadUpdate}
                 unread={unreadIds.has(String(activeChat.id))} onToggleRead={() => toggleActiveChatRead(activeChat)}
                 draft={composerDraft?.chatId === activeChat.id ? composerDraft.text : ""}
                 onDraftApplied={() => setComposerDraft(null)} />
@@ -2052,9 +2477,9 @@ const ChatPanel = ({ isOpen, onClose, requestedCountry, requestedDraft = "", onC
                 <>
                 <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "1rem 1.25rem 0.75rem", borderBottom: "1px solid rgba(255,255,255,0.07)", flexShrink: 0 }}>
                 <div style={{ display: "flex", gap: "0.35rem" }}>
-                {[["chats", "Diplomacy"], ["spy", "Spy"]].map(([key, label]) => (
+                {[["chats", "Diplomacy"], ...(espionageOn ? [["spy", "Spy"]] : [])].map(([key, label]) => (
                     <button key={key} onClick={() => setView(key)} style={{ padding: "0.3rem 0.7rem", borderRadius: "8px", fontSize: "0.85rem", fontWeight: 700, cursor: "pointer", fontFamily: "sans-serif",
-                        border: "1px solid " + (view === key ? "rgba(167,139,250,0.45)" : "transparent"), background: view === key ? "rgba(139,92,246,0.22)" : "transparent", color: view === key ? "white" : "rgba(255,255,255,0.5)" }}>
+                        border: "1px solid " + (currentView === key ? "rgba(167,139,250,0.45)" : "transparent"), background: currentView === key ? "rgba(139,92,246,0.22)" : "transparent", color: currentView === key ? "white" : "rgba(255,255,255,0.5)" }}>
                     {label}
                     </button>
                 ))}
@@ -2063,7 +2488,7 @@ const ChatPanel = ({ isOpen, onClose, requestedCountry, requestedDraft = "", onC
                 onMouseEnter={e => { e.currentTarget.style.color = "white"; e.currentTarget.style.background = "rgba(255,255,255,0.08)"; }}
                 onMouseLeave={e => { e.currentTarget.style.color = "rgba(255,255,255,0.5)"; e.currentTarget.style.background = "none"; }}>✕</button>
                 </div>
-                {view === "spy" ? (
+                {currentView === "spy" ? (
                     <SpyView playerCountry={playerCountry} gameDate={gameDate} countries={countries} loadingCountries={loadingCountries} />
                 ) : (
                 <>
@@ -2315,8 +2740,13 @@ const Chat = ({ hovered, setHovered, isOpen, onToggle }) => {
         let cancelled = false;
         const check = async (provided = null, { force = false } = {}) => {
             try {
-                const saved = provided ?? await loadAllChats({ force });
-                if (cancelled || !Array.isArray(saved)) return;
+                const stored = provided ?? await loadAllChats({ force });
+                if (cancelled || !Array.isArray(stored)) return;
+                // A letter an unseen event delivered announces itself when the
+                // reveal reaches that event, not when the turn is written
+                // (runtime/unseenEvents.js) — the toast would say what the
+                // reveal is about to show.
+                const saved = withoutUnseenChats(stored, unseenEventIdsFor(await readWorldStateView().catch(() => null)));
 
                 const open = saved.filter((chat) =>
                     chat.status !== "closed" &&
@@ -2503,6 +2933,8 @@ const Chat = ({ hovered, setHovered, isOpen, onToggle }) => {
         document.addEventListener("visibilitychange", onVisibilityChange);
         window.addEventListener("oh:runtime-json-updated", onRuntimeUpdate);
         window.addEventListener("oh:diplomacy-chats-updated", onExternalChatUpdate);
+        // A reveal step may uncover a letter the turn delivered.
+        window.addEventListener(UNSEEN_EVENTS_CHANGED, onExternalChatUpdate);
         // A save switch is a different set of threads: drop the baseline and the
         // pending toasts, and re-seed from the new save without announcing it.
         const onActiveGameChanged = () => {
@@ -2522,19 +2954,11 @@ const Chat = ({ hovered, setHovered, isOpen, onToggle }) => {
             document.removeEventListener("visibilitychange", onVisibilityChange);
             window.removeEventListener("oh:runtime-json-updated", onRuntimeUpdate);
             window.removeEventListener("oh:diplomacy-chats-updated", onExternalChatUpdate);
+            window.removeEventListener(UNSEEN_EVENTS_CHANGED, onExternalChatUpdate);
             window.removeEventListener("oh:active-game-changed", onActiveGameChanged);
         };
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [isOpen, soundEnabled]);
-
-    useEffect(() => {
-        const handler = (country) => {
-            setPendingCountry(country);
-            if (!isOpen) onToggle();
-        };
-        _chatOpenSubs.add(handler);
-        return () => _chatOpenSubs.delete(handler);
-    }, [isOpen, onToggle]);
 
     const toggleSound = () => {
         const next = !soundEnabled;
@@ -2645,6 +3069,10 @@ const Chat = ({ hovered, setHovered, isOpen, onToggle }) => {
     }, [unseenCount, notificationItems.length, soundEnabled, desktopPermission]);
 
     useEffect(() => {
+        // The one subscription this component holds. A second copy of this effect
+        // crept in with the notification watcher and toggled the panel a second
+        // time on every request, so the diplomacy button on a country popup opened
+        // the chat and closed it again in the same tick.
         const handler = (country, draft) => {
             setPendingCountry(country);
             setPendingDraft(draft || "");
@@ -2957,8 +3385,10 @@ const Toolbar = memo(({ onOpenAdvisor, activePanel, onTogglePanel, mapRef }) => 
     const [hoveredChat, setHoveredChat]       = useState(false);
     const [hoveredActions, setHoveredActions] = useState(false);
     const [hoveredProjects, setHoveredProjects] = useState(false);
+    // The dock grows by one button per launcher; its geometry lives in hudDock.js
+    // so the Search control beside it moves with it.
     return (
-        <div style={{ position: "fixed", bottom: "0.5rem", left: "0.5rem", height: "4rem", width: "12.8rem", gap: "0.75rem", padding: "0 0.1rem", backgroundColor: "var(--oh-hud-bg)", backdropFilter: "var(--oh-hud-blur)", zIndex: 9999, display: "flex", alignItems: "center", justifyContent: "center", color: "white", fontFamily: "sans-serif", borderRadius: "14px", border: "1px solid var(--oh-hud-border)", boxShadow: "var(--oh-hud-shadow-soft)" }}>
+        <div style={{ position: "fixed", bottom: `${DOCK_BOTTOM_REM}rem`, left: `${DOCK_LEFT_REM}rem`, height: `${DOCK_HEIGHT_REM}rem`, width: DOCK_WIDTH, gap: `${DOCK_GAP_REM}rem`, padding: "0 0.1rem", backgroundColor: "var(--oh-hud-bg)", backdropFilter: "var(--oh-hud-blur)", zIndex: 9999, display: "flex", alignItems: "center", justifyContent: "center", color: "white", fontFamily: "sans-serif", borderRadius: "14px", border: "1px solid var(--oh-hud-border)", boxShadow: "var(--oh-hud-shadow-soft)" }}>
         <Chat hovered={hoveredChat} setHovered={setHoveredChat} isOpen={activePanel === "chat"} onToggle={() => onTogglePanel("chat")} />
         <Actions onOpenAdvisor={onOpenAdvisor} hovered={hoveredActions} setHovered={setHoveredActions} isOpen={activePanel === "actions"} onToggle={() => onTogglePanel("actions")} />
         <Projects onOpenAdvisor={onOpenAdvisor} mapRef={mapRef} hovered={hoveredProjects} setHovered={setHoveredProjects} isOpen={activePanel === "projects"} onToggle={() => onTogglePanel("projects")} />

@@ -1,4 +1,4 @@
-/*! Open Historia — desktop app shell © 2026 Nicholas Krol, MIT (see src/Editor/LICENSE). */
+/*! Open Historia — desktop app shell © 2026 Nicholas Krol, AGPL-3.0-or-later (see LICENSE). */
 // The desktop app used to be a .bat file: it made the player install Node, ran
 // `npm install`, built the client with Vite ON THEIR MACHINE, and left a console
 // window open for the whole session. This replaces all of that. The client is
@@ -101,10 +101,33 @@ if (IS_BETA) process.env.OH_DESKTOP_UPDATE_URL = BETA_UPDATE_MANIFEST;
 // Main-process crashes are the ones that reach the player as a bare "A
 // JavaScript error occurred in the main process" dialog with nothing to act on —
 // the EADDRINUSE port clash was exactly that. They also happen BEFORE the server
-// exists, so this writes the same JSONL directly rather than POSTing to /api/log
-// like the page does. Same file, same shape; logStore.js owns rotation and
-// redaction for everything written later.
+// exists, so this writes the Desktop log's JSONL directly rather than through the
+// server. Same file, same shape; logStore.js owns rotation, and the page merges
+// these entries into the Logging file a player sends (Settings → Diagnostics).
 const LOG_FILE = path.join(DATA_DIR, "logs", "app.log");
+// The same redaction rules as the page and the server (server/logRedaction.js),
+// with this machine's home folder, which names the player. That module is ESM,
+// and an older Electron's Node cannot require() one; there the home folder is
+// still replaced here, and everything is redacted in full again as it is read
+// back into a Logging file.
+const HOME_DIR = (() => {
+  try {
+    return require("node:os").homedir();
+  } catch {
+    return "";
+  }
+})();
+const redactForLog = (() => {
+  try {
+    const { redactLogText } = require(path.join(__dirname, "..", "server", "logRedaction.js"));
+    return (text) => redactLogText(text, { homeDir: HOME_DIR });
+  } catch {
+    const home = HOME_DIR.replace(/[\\/]+$/, "");
+    if (home.length < 3) return (text) => text;
+    const spellings = [...new Set([home, home.replace(/\\/g, "\\\\"), home.replace(/\\/g, "/")])];
+    return (text) => spellings.reduce((out, spelling) => out.split(spelling).join("~"), text);
+  }
+})();
 const logMain = (level, event, message, data) => {
   try {
     fs.mkdirSync(path.dirname(LOG_FILE), { recursive: true });
@@ -113,8 +136,8 @@ const logMain = (level, event, message, data) => {
       level,
       source: "main",
       event,
-      message: String(message ?? "").slice(0, 8000),
-      ...(data === undefined ? {} : { data }),
+      message: redactForLog(String(message ?? "")).slice(0, 8000),
+      ...(data === undefined ? {} : { data: redactForLog(JSON.stringify(data)) }),
     }) + "\n", "utf8");
   } catch {
     // Diagnostics must never become the failure they were meant to explain.
@@ -168,7 +191,12 @@ const AUTO_UPDATE_SUPPORTED = process.platform !== "darwin";
 // What the banner polls. One object, replaced rather than mutated, so a read is
 // always internally consistent.
 let updateState = { state: "idle", percent: 0, version: "", error: "" };
-const setUpdateState = (patch) => { updateState = { ...updateState, ...patch }; };
+const setUpdateState = (patch) => {
+  updateState = { ...updateState, ...patch };
+  // A failed update used to be visible only as the banner's button coming back;
+  // the reason lives here and nowhere else, so it goes to the Desktop log as well.
+  if (patch.state === "error") logMain("warn", "updater.failed", updateState.error);
+};
 
 const setupAutoUpdater = () => {
   // A dev run has no app-update.yml inside it, so electron-updater would only
@@ -180,6 +208,17 @@ const setupAutoUpdater = () => {
   } catch {
     return null; // not packaged with the app: fall back to the download link
   }
+  // electron-updater is silent unless given a logger, and its messages are the
+  // whole story of a failed update — which feed it read, the version it
+  // compared against, why a differential download fell back, the HTTP status
+  // that ended it. Into the Desktop log with everything else, so "the update didn't
+  // take" comes with a reason attached.
+  autoUpdater.logger = {
+    debug: () => {},
+    info: (message) => logMain("info", "updater", message),
+    warn: (message) => logMain("warn", "updater", message),
+    error: (message) => logMain("error", "updater", message),
+  };
   // The banner decides when to download — a player on a metered connection
   // should not have ~100MB pulled out from under them by opening the game.
   autoUpdater.autoDownload = false;
@@ -271,6 +310,28 @@ let setupWindow = null;
 // verifyMapData() below closes that: it runs the fetcher's --ensure pass after
 // the window is up, which checks the SHA-256 of anything it has not already
 // verified and quietly re-downloads what doesn't match.
+// Until this build the stock world lived as the built-in scenario's own
+// regions.geojson; the manifest now keeps it under server/data/stock. An
+// install that already has the file needs no 55 MB download, so it is moved
+// into place BEFORE the manifest is checked. server/libraryStore.js does the
+// same for the installs that never pass through this screen (source, Termux).
+const relocateLegacyStockMap = () => {
+  try {
+    const manifest = JSON.parse(fs.readFileSync(MANIFEST, "utf8"));
+    const stock = (manifest.assets ?? []).find((asset) => asset.path === "server/data/stock/regions.geojson");
+    if (!stock) return;
+    const target = path.join(USER_ROOT, stock.path);
+    const legacy = path.join(USER_ROOT, "server", "data", "scenarios", "default", "regions.geojson");
+    if (fs.existsSync(target) || !fs.existsSync(legacy)) return;
+    // A file of another size is a map the player put there, not ours to move.
+    if (fs.statSync(legacy).size !== stock.bytes) return;
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.renameSync(legacy, target);
+  } catch {
+    // Best effort: the fetcher downloads the file if this could not move it.
+  }
+};
+
 const missingAssets = () => {
   let manifest;
   try {
@@ -536,6 +597,7 @@ const startServer = async () => {
 
 const boot = async () => {
   installAutoUpdater();
+  relocateLegacyStockMap();
   const pending = missingAssets();
   if (pending.length) {
     setupWindow = createSetupWindow();
@@ -569,7 +631,7 @@ const boot = async () => {
   verifyMapData();
 };
 
-// A boot failure used to be an unhandled rejection: it reached app.log and
+// A boot failure used to be an unhandled rejection: it reached the Desktop log and
 // nothing else, leaving an empty window on screen and the player with nothing to
 // act on. "It does not launch" is what that looks like from outside. Whatever
 // went wrong, say it and stop.

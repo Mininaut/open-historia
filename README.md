@@ -1,4 +1,12 @@
-<!-- Open Historia — portions (install, Android app, hub & preset docs) © 2026 Nicholas Krol, MIT (see src/Editor/LICENSE). -->
+## License & Copyright
+
+Copyright (C) 2026 Open Historia
+
+This project is licensed under the terms of the GNU Affero General Public License v3.0 or later (AGPL-3.0-or-later). See the [LICENSE](LICENSE) file for details.
+
+Contributions are accepted under the [Contributor Copyright Assignment Agreement](CLA.md), which assigns the copyright in contributions to the Open Historia Organisation. CLA Assistant asks you to sign it on your first pull request; see [CONTRIBUTING.md](CONTRIBUTING.md).
+
+<!-- Open Historia — portions (install, Android app, hub & preset docs) © 2026 Nicholas Krol, AGPL-3.0-or-later (see LICENSE). -->
 <h1 align="center">Open Historia</h1>
 
 <div align="center">
@@ -20,8 +28,8 @@
   </a>
   <!-- License -->
   <a href="LICENSE">
-    <img src="https://img.shields.io/badge/license-MIT-blue.svg?style=flat-square"
-      alt="License: MIT" />
+    <img src="https://img.shields.io/badge/license-AGPL--3.0-blue.svg?style=flat-square"
+      alt="License: AGPL-3.0" />
   </a>
   <!-- Status -->
   <a href="#">
@@ -189,8 +197,8 @@ OH_HOST=192.168.1.20 node server/server.js # one interface only
 > `optionalDependency`, so npm reports the failure and carries on — but there is no
 > reason to download it in the first place.
 
-> **Note:** the large map binaries (`*.pmtiles`, `public/assets/*-seed.*`, and
-> `server/data/scenarios/default/regions.geojson`) are **not** in the repo — they are
+> **Note:** the large map binaries (`*.pmtiles`, `public/assets/*-seed.*`, and the stock
+> world `server/data/stock/regions.geojson`) are **not** in the repo — they are
 > hosted as [GitHub Release assets](https://github.com/Open-Historia/open-historia/releases/tag/map-data)
 > and downloaded by `scripts/fetch-map-assets.mjs`. The launcher script for your platform
 > runs this for you automatically, so a plain ZIP download works too — no Git LFS needed.
@@ -211,7 +219,11 @@ To rebuild an official preset from source (specs live in `scripts/presets/`):
 node scripts/presets/build-preset.mjs scripts/presets/wwii-1939.spec.mjs
 ```
 
-To regenerate the built-in Modern Day map: `node scripts/build-default-map.mjs`
+The built-in Modern Day map is authored in the Scenario Workshop and lives in the repo as
+`server/seed/default/regions.geojson` (with its cities, world and colours beside it); the server
+copies that seed into its data directory on first run and whenever the seed's `builtInMap` changes.
+`node scripts/build-default-map.mjs` regenerates the *stock* GADM world instead — the map every
+scenario without one of its own (the hub presets) renders on.
 
 ## 🗺️ Map editor
 

@@ -71,7 +71,7 @@ Delivery leans on **rolling releases** (fixed tags whose assets are re-uploaded 
 | `android-beta` | `android-apk-beta.yml` *(off-main, §4.3)* | `workflow_dispatch`, checks out `alpha` | `pax-historia.apk` | **yes** (`--prerelease`) | Experimental in-app-server Android build; isolated from stable |
 | `map-data` | *manually uploaded* | — | `regions.pmtiles`, `countries.pmtiles`, `cities.pmtiles`, `cities-seed.json`, `regions-seed-z8.geojson`, `default-regions-names.geojson` | — | The ~200 MB world-map binaries, off Git LFS (§7) |
 
-The APK asset name is contractual — it (and the Android `appId`) must not change, because anything holding a fixed release/asset URL keeps pointing at the old name. It WAS changed, from `pax-historia.apk` to `open-historia.apk`, on 2026-09-04 (main `e29967e`, with the README and site/index.html updated to match). The old asset is still on the `android` release and is now frozen at the 2026-09-03 build, so anything still fetching it by name will never see another update. In practice the in-app check reads `apk` out of `android/latest.json` rather than a fixed filename — and that file does not exist and is written by no workflow, so the in-app Android update is inert either way. Decide which of those two to fix before renaming it again.
+The APK asset name is contractual — it (and the Android `appId`) must not change, because anything holding a fixed release/asset URL keeps pointing at the old name. It WAS changed, from `pax-historia.apk` to `open-historia.apk`, on 2026-09-04 (main `e29967e`, with the README and site/index.html updated to match). The old asset has since been deleted from the `android` release (only `open-historia.apk` is there, checked 2026-09-10), so anything still fetching it by name gets a 404. In practice the in-app check reads `apk` out of `android/latest.json` rather than a fixed filename — and that file does not exist and is written by no workflow, so the in-app Android update is inert either way. Decide which of those two to fix before renaming it again.
 
 ---
 
@@ -262,7 +262,7 @@ The ~200 MB world-map binaries left Git LFS (whose free 1 GB/mo org-wide bandwid
 
 - **Manifest:** `scripts/map-assets.json` — `owner`/`repo`/`release` (`Open-Historia`/`open-historia`/`map-data`) plus each asset's `path`, release `asset` name, `bytes`, and `sha256`.
 - **Fetcher:** `scripts/fetch-map-assets.mjs` makes the local tree match the manifest. Full run verifies SHA-256 and re-fetches anything missing or changed; `--ensure` trusts byte-size for speed. **Best-effort — never exits non-zero**, so it can never block a launch, update, or the `app-bundle.yml` bundle step. Downloads to a `.download` temp then atomic-renames.
-- **Name namespaces:** the manifest maps a *versioned* release asset name to a *stable* local path — e.g. `regions-seed-z8.geojson` (release) → `public/assets/regions-seed.geojson` (tree), and `default-regions-names.geojson` → `server/data/scenarios/default/regions.geojson`. The client always reads the stable path.
+- **Name namespaces:** the manifest maps a *versioned* release asset name to a *stable* local path — e.g. `regions-seed-z8.geojson` (release) → `public/assets/regions-seed.geojson` (tree), and `default-regions-names.geojson` → `server/data/stock/regions.geojson` (the stock world every scenario without a map of its own renders on; it used to be the built-in scenario's file). The client always reads the stable path. The built-in scenario's own map is not on the release at all: it ships in the app as `server/seed/default/regions.geojson` (see [Assets](assets-and-data.md) §3).
 - **Callers:** the app launchers/updater and `app-bundle.yml` call it in place of `git lfs pull`. **Never re-add these files to Git LFS.**
 
 When a map file changes: upload the new asset to the `map-data` Release, then update its `sha256` + `bytes` in `scripts/map-assets.json`.
@@ -288,7 +288,7 @@ The ~200 MB map binaries deliberately never ship in the APK — the app download
 
 ## 10. Web-mode seed (`seed-web-defaults.mjs`)
 
-`scripts/seed-web-defaults.mjs` runs only from `build:web` / `build:site` / `dev:web`. It bundles the built-in `default` scenario (`server/data/scenarios/default`) into JS modules under `src/runtime/web/generated/` (git-ignored) so a fresh browser can seed its IndexedDB library with a playable scenario. The desktop build never imports these, so no seed data ships in the download.
+`scripts/seed-web-defaults.mjs` runs only from `build:web` / `build:site` / `dev:web`. It bundles the built-in `default` scenario (`server/seed/default`) into JS modules under `src/runtime/web/generated/` (git-ignored) so a fresh browser can seed its IndexedDB library with a playable scenario; the scenario's own map (`regions.geojson`, ~5.6 MB) is copied beside them and becomes a hashed static asset of the web build, referenced from `defaultScenarioMeta.js`. The desktop build never imports these, so no seed data ships in the download.
 
 | Output | Content |
 |---|---|
@@ -296,7 +296,7 @@ The ~200 MB map binaries deliberately never ship in the APK — the app download
 | `countryNames.js` | Canonical code→name registry, mirroring `server/country-names.json` (used by `canonicalizeCountryRef`) |
 | `fallbackColors.js` | App-level default palette from `public/assets/colors.json`, immutable & scenario-independent |
 
-It reads only from `server/data`, which **is** committed — so the website build (including CI) needs nothing from the `map-data` Release.
+It reads only from `server/seed/default`, which **is** committed (map included) — so the website build (including CI) needs nothing from the `map-data` Release.
 
 ---
 
@@ -327,7 +327,7 @@ Key asymmetries a newcomer should internalize:
 
 - **Never re-add map binaries to Git LFS** — they live on the `map-data` Release only (§8).
 - **Never let a pmtiles/large geojson into a Pages build** — the `oh-drop-map-binaries` plugin, both CI size guards, and the local deploy engine's `findOversized` all defend the 25 MiB Pages limit, which rejects *after* a green build (`vite.config.ts:43`, `deploy-site.yml:58`, `deploy-site.mjs:95`).
-- **The Android `appId` must never change.** The APK asset name was changed once (`pax-historia.apk` → `open-historia.apk`, 2026-09-04); the old asset is frozen on the release. See §4.2 before doing it again.
+- **The Android `appId` must never change.** The APK asset name was changed once (`pax-historia.apk` → `open-historia.apk`, 2026-09-04); the old asset has since been deleted from the release. See §3 before doing it again.
 - **Assemble the mobile server before `cap sync`** — `android-apk.yml` runs `build-mobile-server.mjs` between `npm run build` and Gradle.
 - **`ROOT_PAGES` is fail-hard, `ROOT_ASSETS` is fail-soft** — a dropped root *page* fails `build:site`; a dropped root *image* is only a cosmetic 404 (`assemble-site.mjs:46`, `:59`).
 - **`deploy-site.yml` is superseded but still on `main`** — the admin-panel button is the live path; the yml stays because the pushing token lacks the `workflow` scope to delete it.
@@ -338,5 +338,5 @@ Key asymmetries a newcomer should internalize:
 ### See also
 
 - [World state](world-state.md) — the `world.json` shape that scenarios and the web seed carry
-- [Web mode & content nodes](web-mode.md) — how the browser build resolves map data from the signed directory
-- [Scenario hub](hub-and-scenarios.md) — the import flow that feeds the import counter
+- [Web mode & content nodes](web-build.md) — how the browser build resolves map data from the signed directory
+- [Scenario hub](runtime-services.md) — the import flow that feeds the import counter

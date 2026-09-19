@@ -1,23 +1,41 @@
-/*! Open Historia — portions (reasoning toggle + small-screen menu) © 2026 Nicholas Krol, MIT (see src/Editor/LICENSE). */
+/*! Open Historia — portions (reasoning toggle + small-screen menu) © 2026 Nicholas Krol, AGPL-3.0-or-later (see LICENSE). */
 import React, { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import {
     AI_TASK_ROUTING,
+    CONNECTION_TEMPLATES,
     DEFAULT_PROVIDER,
     PROVIDER_OPTIONS,
-    deletePreset,
-    getProviderField,
+    addConnection,
+    addEntry,
+    clearFallbackList,
+    connectionDisplayName,
+    entriesUsingConnection,
+    fillFallbackList,
+    getConnections,
+    getEntryStatus,
+    getFallbackList,
     getProviderMeta,
+    getRateLimitPolicy,
     getReasoningEnabled,
     getRecentModels,
-    getSavedPresets,
+    getResolvedFallbackList,
+    getTaskPick,
+    moveEntry,
+    providerSetupRequirement,
     providerSupportsModelDiscovery,
-    savePreset,
-    setProviderField,
+    removeConnection,
+    removeEntry,
+    resetEntryState,
+    setRateLimitPolicy,
     setReasoningEnabled,
-    updatePreset,
+    setTaskPick,
+    updateConnection,
+    updateEntry,
 } from "../AI/providerConfig.js";
 import { isZenFreeModel, OPENCODE_ZEN_ENDPOINT } from "../AI/openCodeZen.js";
+import { formatResetTime } from "../AI/fallbackRunner.js";
+import { REVIEW_SECTIONS, announceRequestBudgetChange, describeJumpCost, requestDay, requestSettings } from "../AI/requestBudget.js";
 import {
     isRatingEnabled,
     isTelemetryEnabled,
@@ -33,29 +51,35 @@ import {
 } from "../AI/structuredMode.js";
 import {
     getLanguageOptions,
+    languageDisplayName,
     getStoredChatLanguage,
     getStoredLanguage,
     setStoredChatLanguage,
     setStoredLanguage,
 } from "../../runtime/i18n.js";
-import { MAP_SETTING_KEYS, applySaveBetaUnits, getMapSetting, getMapSettingDefaultOn, isBetaUnits, resolveBetaUnits, setMapSetting, setMapSettingValue, useMapSettingValue } from "../../runtime/mapSettings.js";
+import { LABEL_FONT_SUGGESTIONS, MAP_SETTING_KEYS, getMapSetting, getMapSettingDefaultOn, setMapSetting, setMapSettingValue, useMapSettingValue } from "../../runtime/mapSettings.js";
 import { getLibraryState } from "../../runtime/library.js";
-import { readGameData, writeGameData } from "../../runtime/gameState.js";
 import { copyToClipboard } from "../../runtime/clipboard.js";
 import {
-    buildDebugLogReport,
+    buildLoggingFile,
     clearDebugLog,
-    debugLogFilename,
+    fetchDesktopLog,
     formatLogSize,
     getDebugLogBytes,
     getDebugLogLimitBytes,
     getDebugLogSize,
+    getLoggingFileEntries,
     isDebugLogEnabled,
     isDebugLogVerbose,
+    logDebugEvent,
+    logSettingChange,
     setDebugLogEnabled,
     setDebugLogVerbose,
     subscribeToDebugLog,
 } from "../../runtime/debugLog.js";
+import { saveDebugLogFile } from "../../runtime/saveDebugLog.js";
+import { buildGameZipBlob, formatZipSize, saveGameZipToDisk } from "../../runtime/gameZip.js";
+import { isNativeApp } from "../../runtime/web/nativeBoot.js";
 import { useIsMobile } from "../../runtime/useIsMobile.js";
 import { usePresenceLeaving } from "./presence.jsx";
 import { ESRI_BASEMAPS, isBuiltinBasemapId } from "../../runtime/assets.js";
@@ -123,7 +147,7 @@ const primaryButtonStyle = {
     borderColor: "rgba(59,130,246,0.6)",
 };
 
-const profileCardStyle = {
+const listCardStyle = {
     display: "flex",
     alignItems: "center",
     justifyContent: "space-between",
@@ -223,6 +247,8 @@ const LanguageSelector = () => {
         }
 
         setSaving(true);
+        // Before the reload below; the log is flushed on pagehide.
+        logSettingChange("UI language", languageDisplayName(code));
         // Saves on the server too, so the phone app follows the same choice.
         await setStoredLanguage(code);
         // Reload so the translator starts (or stops) cleanly and every
@@ -246,6 +272,7 @@ const ChatLanguageSelector = () => {
 
         setStoredChatLanguage(code);
         setCurrent(code);
+        logSettingChange("AI chat language", languageDisplayName(code));
     };
 
     return (
@@ -531,210 +558,430 @@ const SettingsInput = ({
     );
 };
 
-// Configuration profiles (ported from the abdulrahman-2005 fork): saved
-// endpoint/key/model/parameter bundles for the two "compatible" providers, so
-// switching between a local server and a hosted gateway is one click.
-const PROFILE_FORM_PREFIX = {
-    "openai-compatible": "openaiCompatible",
-    "anthropic-compatible": "anthropicCompatible",
+// --- The Fallback list (docs/world-state.md, "AI access") ---
+//
+// Settings → AI is the Fallback list: backup models, tried from the top, each
+// one a Connection (a provider, a name, a key) and a model. With one entry it
+// reads like the old single-provider form; "Add a backup" and Fill are the only
+// new things a player who never uses them sees. Every field saves as it is
+// typed (providerConfig.js), and every save announces itself, which is what
+// re-renders this screen and the start-of-game prompt.
+
+// What the screen shows, re-read on every change and every 15 seconds so a
+// "back in 40s" counts down.
+const readFallbackView = () => {
+    const at = Date.now();
+    const resolved = new Map(getResolvedFallbackList().map((entry) => [entry.id, entry]));
+    return {
+        at,
+        connections: getConnections(),
+        entries: getFallbackList().map((entry) => ({
+            ...entry,
+            resolved: resolved.get(entry.id) ?? null,
+            status: getEntryStatus(entry.id, at),
+        })),
+        rateLimitPolicy: getRateLimitPolicy(),
+    };
 };
 
-const EMPTY_PROFILE_FORM = { name: "", endpoint: "", apiKey: "", model: "", customParams: "" };
+const useFallbackView = () => {
+    const [view, setView] = useState(readFallbackView);
+    useEffect(() => {
+        const refresh = () => setView(readFallbackView());
+        window.addEventListener("ai:fallback-changed", refresh);
+        // The countdown only has to tick for someone watching it.
+        const timer = setInterval(() => {
+            if (document.visibilityState !== "hidden") refresh();
+        }, 15000);
+        return () => {
+            window.removeEventListener("ai:fallback-changed", refresh);
+            clearInterval(timer);
+        };
+    }, []);
+    return view;
+};
 
-const PresetManager = ({ provider, settings, onSettingChange }) => {
-    const prefix = PROFILE_FORM_PREFIX[provider];
-    const loadPresets = () => getSavedPresets().filter((preset) => preset.provider === provider);
-    // Keyed by provider where it is mounted, so a provider switch remounts it
-    // with fresh state instead of syncing in an effect.
-    const [presets, setPresets] = useState(loadPresets);
-    const [editingId, setEditingId] = useState(null);
-    const [form, setForm] = useState(EMPTY_PROFILE_FORM);
+const formatAgo = (ms, at) => {
+    const minutes = Math.round(Math.max(0, at - ms) / 60000);
+    if (minutes < 1) return "just now";
+    if (minutes < 60) return `${minutes} min ago`;
+    const hours = Math.round(minutes / 60);
+    return hours < 24 ? `${hours} h ago` : new Date(ms).toLocaleDateString();
+};
 
-    if (!prefix) return null;
+const STATUS_COLORS = {
+    ready: { color: "#86efac", border: "rgba(134,239,172,0.28)", background: "rgba(34,197,94,0.1)" },
+    spent: { color: "#fbbf24", border: "rgba(245,158,11,0.32)", background: "rgba(245,158,11,0.1)" },
+    unusable: { color: "#fca5a5", border: "rgba(248,113,113,0.34)", background: "rgba(239,68,68,0.1)" },
+    busy: { color: "#93c5fd", border: "rgba(96,165,250,0.3)", background: "rgba(59,130,246,0.1)" },
+};
 
-    const currentEndpoint = settings[`${prefix}Endpoint`] ?? "";
-    const currentModel = settings[`${prefix}Model`] ?? "";
-    const setField = (key) => (value) => setForm((current) => ({ ...current, [key]: value }));
-
-    const apply = (preset) => {
-        onSettingChange(`${prefix}Endpoint`, preset.settings?.endpoint ?? "");
-        // A profile saved without a key leaves the current key alone: the stock
-        // profiles have none, and wiping a pasted key on "Apply" is never wanted.
-        if (preset.settings?.apiKey) onSettingChange(`${prefix}ApiKey`, preset.settings.apiKey);
-        onSettingChange(`${prefix}Model`, preset.settings?.model ?? "");
-        onSettingChange(`${prefix}CustomParams`, preset.settings?.customParams ?? "");
-    };
-
-    const startCreate = () => {
-        // Prefilled from the fields above, so "save this setup" is one click.
-        setForm({
-            name: "",
-            endpoint: currentEndpoint,
-            apiKey: settings[`${prefix}ApiKey`] ?? "",
-            model: currentModel,
-            customParams: settings[`${prefix}CustomParams`] ?? "",
-        });
-        setEditingId("new");
-    };
-
-    const startEdit = (preset) => {
-        setForm({
-            name: preset.name ?? "",
-            endpoint: preset.settings?.endpoint ?? "",
-            apiKey: preset.settings?.apiKey ?? "",
-            model: preset.settings?.model ?? "",
-            customParams: preset.settings?.customParams ?? "",
-        });
-        setEditingId(preset.id);
-    };
-
-    const saveForm = () => {
-        const name = form.name.trim();
-        if (!name) return;
-        const values = { endpoint: form.endpoint, apiKey: form.apiKey, model: form.model, customParams: form.customParams };
-        if (editingId === "new") savePreset(provider, name, values);
-        else updatePreset(editingId, name, values);
-        setPresets(loadPresets());
-        setEditingId(null);
-    };
-
-    const remove = (preset) => {
-        if (!window.confirm(`Delete the "${preset.name}" profile?`)) return;
-        deletePreset(preset.id);
-        setPresets(loadPresets());
-    };
-
-    const box = {
-        marginBottom: "0.85rem",
-        padding: "0.7rem",
-        borderRadius: "8px",
-        border: "1px solid rgba(255,255,255,0.12)",
-        backgroundColor: "rgba(0,0,0,0.12)",
-    };
-
-    if (editingId) {
-        return (
-            <div style={box}>
-            <div style={{ fontSize: "0.8rem", fontWeight: 700, marginBottom: "0.6rem" }}>
-            {editingId === "new" ? "New profile" : "Edit profile"}
-            </div>
-            <SettingsInput label="Profile name" value={form.name} onChange={setField("name")} placeholder="My local server" />
-            <SettingsInput label="API endpoint" value={form.endpoint} onChange={setField("endpoint")} placeholder="http://localhost:11434/v1" />
-            <SettingsInput
-            label="API key (optional)"
-            type="password"
-            value={form.apiKey}
-            onChange={setField("apiKey")}
-            placeholder="Leave empty to keep the current key when applied"
-            />
-            <SettingsInput label="Model" value={form.model} onChange={setField("model")} placeholder="Leave blank to auto-pick if supported" />
-            <SettingsInput
-            label="Custom parameters (JSON)"
-            multiline
-            value={form.customParams}
-            onChange={setField("customParams")}
-            placeholder='{"top_p": 0.9}'
-            />
-            <div style={{ display: "flex", gap: "0.5rem" }}>
-            <button type="button" onClick={saveForm} disabled={!form.name.trim()} style={{ ...primaryButtonStyle, opacity: form.name.trim() ? 1 : 0.5 }}>
-            Save profile
-            </button>
-            <button type="button" onClick={() => setEditingId(null)} style={smallButtonStyle}>
-            Cancel
-            </button>
-            </div>
-            </div>
-        );
+const describeRowStatus = (status, at) => {
+    if (status.status === "spent") return `Spent until ${formatResetTime(status.until)}`;
+    if (status.status === "unusable") return `Unusable: ${status.reason}`;
+    if (status.status === "busy") {
+        const seconds = Math.max(1, Math.ceil((status.until - at) / 1000));
+        return `${status.reason === "rate limited" ? "Rate limited" : "Busy"}, back in ${seconds < 90 ? `${seconds}s` : `${Math.ceil(seconds / 60)} min`}`;
     }
+    return "Ready";
+};
 
+const StatusChip = ({ status, at }) => {
+    const colors = STATUS_COLORS[status.status] ?? STATUS_COLORS.ready;
     return (
-        <div style={box}>
-        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "0.5rem" }}>
-        <div style={{ fontSize: "0.8rem", fontWeight: 700 }}>Configuration profiles</div>
-        <button type="button" onClick={startCreate} style={primaryButtonStyle}>+ Save current</button>
+        <span style={{ background: colors.background, border: `1px solid ${colors.border}`, borderRadius: "999px", color: colors.color, fontSize: "0.66rem", fontWeight: 750, padding: "0.12rem 0.5rem", whiteSpace: "nowrap" }}>
+            {describeRowStatus(status, at)}
+        </span>
+    );
+};
+
+// The first Connection, made if there is none: an entry cannot exist without one.
+const ensureConnectionId = (connections) => connections[0]?.id ?? addConnection({ provider: DEFAULT_PROVIDER });
+
+// A Connection's own fields: where it is and what reaches it. Shared by every
+// entry that uses it, which the editor says when it is more than one.
+const ConnectionFields = ({ connection, sharedBy = 1 }) => {
+    const set = (field) => (value) => updateConnection(connection.id, { [field]: value });
+    const selfHosted = providerSetupRequirement(connection.provider) === "endpoint";
+    const meta = getProviderMeta(connection.provider);
+    return (
+        <>
+        <ApiProviderSelector provider={connection.provider} onProviderChange={set("provider")} />
+        <SettingsInput label="Connection name" value={connection.name} onChange={set("name")} placeholder={meta.label} />
+        {selfHosted && (
+            <SettingsInput
+            label="API endpoint"
+            value={connection.endpoint}
+            onChange={set("endpoint")}
+            placeholder={connection.provider === "openai-compatible" ? "http://localhost:11434/v1" : "https://my-proxy.example/v1"}
+            // A server on the player's own machine works from the website too, but only
+            // if it allows this origin — otherwise the browser silently drops the reply.
+            // Say so up front here rather than letting it surface as "Failed to fetch".
+            helperText={connection.provider === "openai-compatible"
+                ? (import.meta.env.VITE_OH_WEB
+                    ? "Base URL that exposes /chat/completions and /models. A server on your own machine (Ollama, LM Studio) also has to allow this site: start Ollama with OLLAMA_ORIGINS set to this site's address, or use the desktop app."
+                    : "Base URL that exposes /chat/completions and /models.")
+                : "Base URL of a self-hosted proxy that speaks the Anthropic Messages API (POST /messages)."}
+            />
+        )}
+        {connection.provider === "opencode-zen" && <OpenCodeZenHelp connection={connection} />}
+        <SettingsInput
+        label={selfHosted ? "API key (optional)" : `${meta.label} API key`}
+        type="password"
+        value={connection.apiKey}
+        onChange={set("apiKey")}
+        placeholder={selfHosted ? "Leave empty if your server needs none" : `Paste ${meta.label} API key`}
+        helperText={`Stored only in this browser.${sharedBy > 1 ? ` Shared by ${sharedBy} entries in your list.` : ""}`}
+        />
+        <SettingsInput
+        label="Custom parameters (JSON)"
+        multiline
+        value={connection.customParams}
+        onChange={set("customParams")}
+        placeholder={connection.provider === "gemini" ? '{"generationConfig": {"topP": 0.9}}' : '{"top_p": 0.9}'}
+        helperText="Optional. Merged into every request this connection sends — e.g. to limit reasoning budget/effort. An entry can override them. Invalid JSON is ignored."
+        />
+        {connection.provider === "openai-compatible" && (
+            <>
+            <Toggle label="Strict tool schema" enabled={connection.toolStrict} onToggle={() => set("toolStrict")(!connection.toolStrict)} />
+            <div style={{ ...helperStyle, marginTop: "-0.6rem" }}>
+            Sends strict:true with the tool call so a self-hosted backend constrains
+            generation to the schema (SGLang/xgrammar, vLLM). Leave off for OpenAI and
+            Azure: they reject a schema that does not list every property as required.
+            </div>
+            </>
+        )}
+        </>
+    );
+};
+
+// One entry: its Connection (and that Connection's fields, where a rejected key
+// is fixed), its model, and the per-model knobs.
+const EntryEditor = ({ entry, connections, entries }) => {
+    const connection = connections.find((candidate) => candidate.id === entry.connectionId) ?? null;
+    const provider = connection?.provider ?? DEFAULT_PROVIDER;
+    const sharedBy = entries.filter((other) => other.connectionId === entry.connectionId).length;
+    const suggestions = [...new Set([connection?.suggestedModel, ...getRecentModels(provider)].filter(Boolean))];
+    const set = (field) => (value) => updateEntry(entry.id, { [field]: value });
+    return (
+        <div>
+        {connections.length > 1 && (
+            <div style={fieldGroupStyle}>
+            <label style={labelStyle}>Connection</label>
+            <select data-no-translate value={entry.connectionId} onChange={(event) => set("connectionId")(event.target.value)} style={{ ...inputStyle, cursor: "pointer" }}>
+            {connections.map((candidate) => (
+                <option key={candidate.id} value={candidate.id} style={{ color: "black" }}>
+                {connectionDisplayName(candidate)} — {getProviderMeta(candidate.provider).label}
+                </option>
+            ))}
+            </select>
+            </div>
+        )}
+        {connection && <ConnectionFields connection={connection} sharedBy={sharedBy} />}
+        {provider === "opencode-zen" && connection ? (
+            <OpenCodeZenModel key={entry.id + connection.id} entry={entry} connection={connection} recentModels={suggestions} />
+        ) : (
+        <SettingsInput
+        label="Model"
+        value={entry.model}
+        onChange={set("model")}
+        suggestions={suggestions}
+        placeholder={provider === "gemini" ? "gemini-3.5-flash-lite" : provider.startsWith("anthropic") ? "claude-haiku-4-5" : "Model id"}
+        helperText={providerSupportsModelDiscovery(provider)
+            ? "Leave blank to auto-pick a chat-capable model from the server's /models."
+            : "Leave blank to use the built-in default."}
+        />
+        )}
+        <details style={{ marginBottom: "0.4rem" }}>
+        <summary style={{ cursor: "pointer", fontSize: "0.74rem", color: "rgba(255,255,255,0.62)", marginBottom: "0.6rem" }}>This model only</summary>
+        <SettingsInput
+        label="Custom parameters for this model (JSON)"
+        multiline
+        value={entry.customParamsOverride}
+        onChange={set("customParamsOverride")}
+        placeholder="Blank uses the connection's"
+        helperText="Replaces the connection's custom parameters for this entry — e.g. the same model with a larger max_tokens, picked by the Time skip task."
+        />
+        <StructuredModeSelect value={entry.structuredMode} onChange={set("structuredMode")} />
+        </details>
         </div>
-        {presets.length === 0 ? (
-            <div style={{ ...helperStyle, marginTop: 0 }}>No profiles yet. Save the current endpoint and model as one to switch back to it later.</div>
-        ) : presets.map((preset) => {
-            const active = (preset.settings?.endpoint ?? "") === currentEndpoint && (preset.settings?.model ?? "") === currentModel;
-            return (
-                <div key={preset.id} style={profileCardStyle}>
-                <div style={{ minWidth: 0, flex: 1 }}>
-                <div style={{ fontSize: "0.82rem", fontWeight: 600, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-                {preset.name}
-                {active && (
-                    <span style={{ marginLeft: "0.4rem", fontSize: "0.68rem", fontWeight: 700, color: "rgba(147,197,253,0.95)" }}>ACTIVE</span>
-                )}
-                </div>
-                <div style={{ ...helperStyle, marginTop: "0.1rem", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-                {preset.settings?.endpoint || "Default endpoint"}
-                {preset.settings?.model ? ` · ${preset.settings.model}` : ""}
-                </div>
-                </div>
-                <div style={{ display: "flex", gap: "0.3rem", flexShrink: 0 }}>
-                {!active && <button type="button" onClick={() => apply(preset)} style={primaryButtonStyle}>Apply</button>}
-                <button type="button" onClick={() => startEdit(preset)} style={smallButtonStyle}>Edit</button>
-                <button type="button" onClick={() => remove(preset)} style={smallButtonStyle} title="Delete profile">✕</button>
-                </div>
-                </div>
-            );
-        })}
-        <div style={{ ...helperStyle, marginTop: "0.2rem" }}>
-        Stored only in this browser. A profile saved without a key keeps whatever key is entered above when applied.
+    );
+};
+
+const rowButtonStyle = { ...smallButtonStyle, padding: "0.25rem 0.5rem", fontSize: "0.72rem" };
+
+// The Fill button's panel: tick Connections, type models strongest first.
+const FillPanel = ({ connections, onDone }) => {
+    const [ticked, setTicked] = useState(() => connections.map((connection) => connection.id));
+    const [models, setModels] = useState("");
+    const [added, setAdded] = useState(null);
+    const toggle = (id) => setTicked((current) => (current.includes(id) ? current.filter((value) => value !== id) : [...current, id]));
+    const fill = () => {
+        const order = connections.map((connection) => connection.id).filter((id) => ticked.includes(id));
+        setAdded(fillFallbackList(order, models.split(/[\n,]/)));
+    };
+    return (
+        <div style={{ marginTop: "0.7rem", padding: "0.75rem", borderRadius: "10px", border: "1px solid rgba(255,255,255,0.1)", backgroundColor: "rgba(255,255,255,0.03)" }}>
+        <div style={{ fontSize: "0.8rem", fontWeight: 700, marginBottom: "0.4rem" }}>Fill the list</div>
+        <div style={{ ...helperStyle, marginTop: 0, marginBottom: "0.6rem" }}>
+        Every model on every ticked connection, strongest model first across all of
+        them: the first model on each connection, then the second, and so on. Rows
+        you already have are skipped.
+        </div>
+        {connections.map((connection) => (
+            <label key={connection.id} style={{ alignItems: "center", display: "flex", gap: "0.5rem", fontSize: "0.8rem", marginBottom: "0.35rem", cursor: "pointer" }}>
+            <input type="checkbox" checked={ticked.includes(connection.id)} onChange={() => toggle(connection.id)} />
+            {connectionDisplayName(connection)} <span style={{ color: "rgba(255,255,255,0.45)" }}>({getProviderMeta(connection.provider).label})</span>
+            </label>
+        ))}
+        <SettingsInput label="Models, strongest first (one per line)" multiline value={models} onChange={setModels} placeholder={"gemini-3.7-flash\ngemini-3.6-flash\ngemini-3.5-flash\ngemini-3.5-flash-lite"} />
+        <div style={{ alignItems: "center", display: "flex", gap: "0.5rem" }}>
+        <button type="button" onClick={fill} disabled={!ticked.length || !models.trim()} style={{ ...primaryButtonStyle, opacity: ticked.length && models.trim() ? 1 : 0.5 }}>Fill</button>
+        <button type="button" onClick={onDone} style={smallButtonStyle}>Close</button>
+        {added !== null && <span style={{ ...helperStyle, marginTop: 0 }}>{added ? `Added ${added} entr${added === 1 ? "y" : "ies"}.` : "Nothing new to add."}</span>}
         </div>
         </div>
     );
 };
 
-// Per-task model routing (ported from the abdulrahman-2005 fork). Collapsed by
-// default: blank fields inherit the provider default, so the single-model
-// experience is untouched until a player opts in. Hints are placeholders —
-// nothing is written until the player types.
-const TaskModelOverrides = ({ provider, suggestions }) => {
-    const [expanded, setExpanded] = useState(false);
-    // Keyed by provider at the mount site (see PresetManager).
-    const [overrides, setOverrides] = useState(() => Object.fromEntries(AI_TASK_ROUTING.map(({ key }) => [
-        key,
-        getProviderField(provider, `model_${key}`),
-    ])));
+const FallbackListSection = () => {
+    const view = useFallbackView();
+    const [editingId, setEditingId] = useState(null);
+    const [filling, setFilling] = useState(false);
+    const { at, connections, entries } = view;
+    const single = entries.length === 1;
 
-    const update = (key, value) => {
-        setOverrides((current) => ({ ...current, [key]: value }));
-        setProviderField(provider, `model_${key}`, value);
+    const addBackup = () => {
+        const connectionId = entries[entries.length - 1]?.connectionId ?? ensureConnectionId(connections);
+        setEditingId(addEntry({ connectionId, model: "" }));
     };
 
-    const activeCount = Object.values(overrides).filter((value) => value && value.trim()).length;
-    const groups = [...new Set(AI_TASK_ROUTING.map((entry) => entry.group))];
+    const remove = (entry) => {
+        const label = entry.resolved?.label ?? "this entry";
+        if (!window.confirm(`Remove ${label} from the list?`)) return;
+        removeEntry(entry.id);
+    };
+
+    // For a Fill that went wrong. Asks first: until a model is added again,
+    // nothing can answer.
+    const clearAll = () => {
+        const count = entries.length;
+        if (!window.confirm(`Remove all ${count} entr${count === 1 ? "y" : "ies"} from the list? Your connections and keys are kept, so Fill can rebuild it. Until you add a model again, the game can't write turns or replies.`)) return;
+        clearFallbackList();
+        setEditingId(null);
+        // An open Fill panel would still say "Added N entries" about rows that are gone.
+        setFilling(false);
+    };
 
     return (
-        <div style={{ marginBottom: "0.85rem", paddingTop: "0.75rem", borderTop: "1px solid rgba(255,255,255,0.1)" }}>
-        <button
-        type="button"
-        onClick={() => setExpanded((current) => !current)}
-        style={{ ...smallButtonStyle, width: "100%", display: "flex", justifyContent: "space-between" }}
+        <SettingsSection
+        title="Models"
+        description="Backup models: when one runs out, the next one takes over. Every AI call starts at the top of the list and moves down only when a model can't answer."
         >
+        {entries.length === 0 && (
+            <div style={{ ...helperStyle, marginTop: 0, marginBottom: "0.7rem" }}>No models yet. Add one to let the game write turns and replies.</div>
+        )}
+        {single && (
+            <>
+            <div style={{ alignItems: "center", display: "flex", gap: "0.5rem", justifyContent: "flex-end", marginBottom: "0.5rem" }}>
+            <StatusChip status={entries[0].status} at={at} />
+            {entries[0].status.status !== "ready" && <button type="button" onClick={() => resetEntryState(entries[0].id)} style={rowButtonStyle}>Reset</button>}
+            </div>
+            <EntryEditor entry={entries[0]} connections={connections} entries={entries} />
+            </>
+        )}
+        {!single && entries.map((entry, index) => (
+            <div key={entry.id} style={{ ...listCardStyle, flexDirection: "column", alignItems: "stretch" }}>
+            <div style={{ alignItems: "center", display: "flex", gap: "0.5rem", justifyContent: "space-between", flexWrap: "wrap" }}>
+            <div style={{ minWidth: 0, flex: 1 }}>
+            <div data-no-translate style={{ fontSize: "0.82rem", fontWeight: 650, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+            <span style={{ color: "rgba(255,255,255,0.4)", marginRight: "0.4rem" }}>{index + 1}</span>
+            {entry.resolved?.label ?? "(connection removed)"}
+            </div>
+            <div style={{ ...helperStyle, marginTop: "0.15rem" }}>
+            {getProviderMeta(entry.resolved?.provider).label}
+            {entry.status.lastAnsweredAt ? ` · answered ${formatAgo(entry.status.lastAnsweredAt, at)}` : ""}
+            </div>
+            </div>
+            <StatusChip status={entry.status} at={at} />
+            </div>
+            <div style={{ display: "flex", gap: "0.3rem", marginTop: "0.45rem", flexWrap: "wrap" }}>
+            <button type="button" onClick={() => moveEntry(entry.id, index - 1)} disabled={index === 0} aria-label="Move up" title="Move up" style={{ ...rowButtonStyle, opacity: index === 0 ? 0.4 : 1 }}>↑</button>
+            <button type="button" onClick={() => moveEntry(entry.id, index + 1)} disabled={index === entries.length - 1} aria-label="Move down" title="Move down" style={{ ...rowButtonStyle, opacity: index === entries.length - 1 ? 0.4 : 1 }}>↓</button>
+            <button type="button" onClick={() => setEditingId(editingId === entry.id ? null : entry.id)} style={rowButtonStyle}>{editingId === entry.id ? "Done" : "Edit"}</button>
+            {entry.status.status !== "ready" && <button type="button" onClick={() => resetEntryState(entry.id)} title="Try it again on the next call" style={rowButtonStyle}>Reset</button>}
+            <button type="button" onClick={() => remove(entry)} aria-label="Remove" title="Remove from the list" style={rowButtonStyle}>✕</button>
+            </div>
+            {editingId === entry.id && (
+                <div style={{ marginTop: "0.75rem" }}>
+                <EntryEditor entry={entry} connections={connections} entries={entries} />
+                </div>
+            )}
+            </div>
+        ))}
+        <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap", marginTop: "0.6rem" }}>
+        <button type="button" onClick={addBackup} style={primaryButtonStyle}>{entries.length ? "+ Add a backup" : "+ Add a model"}</button>
+        <button type="button" onClick={() => setFilling((open) => !open)} style={smallButtonStyle}>Fill…</button>
+        {entries.length > 0 && <button type="button" onClick={clearAll} style={smallButtonStyle}>Clear list</button>}
+        </div>
+        {filling && <FillPanel connections={connections} onDone={() => setFilling(false)} />}
+        <div style={{ ...fieldGroupStyle, marginTop: "0.9rem" }}>
+        <label style={labelStyle}>When a model is rate limited</label>
+        <select data-no-translate value={view.rateLimitPolicy} onChange={(event) => setRateLimitPolicy(event.target.value)} style={{ ...inputStyle, cursor: "pointer" }}>
+        <option value="wait" style={{ color: "black" }}>Wait, then try it again (default)</option>
+        <option value="next" style={{ color: "black" }}>Try the next one straight away</option>
+        </select>
+        <div style={helperStyle}>
+        A rate limit is a short pause, not a used-up allowance. Waiting keeps your
+        backups' daily allowance for when the top model has truly run out.
+        </div>
+        </div>
+        <div style={{ ...helperStyle, marginBottom: 0 }}>
+        Mix a free key with a paid one, or with a local model. Each key is used under its provider's terms.
+        </div>
+        </SettingsSection>
+    );
+};
+
+// Every saved Connection: add one (from a template or blank), edit it, or
+// remove it along with the entries that use it.
+const ConnectionsSection = () => {
+    const { connections, entries } = useFallbackView();
+    const [editingId, setEditingId] = useState(null);
+
+    // Names the entries that go with it, so a Connection that half the list
+    // hangs off is never removed by surprise.
+    const remove = (connection) => {
+        const usingIds = new Set(entriesUsingConnection(connection.id).map((entry) => entry.id));
+        // Numbered by their place in the list, as the rows above are.
+        const using = entries
+            .map((entry, index) => (usingIds.has(entry.id) ? `${index + 1}. ${entry.resolved?.label ?? entry.model}` : null))
+            .filter(Boolean);
+        const name = connectionDisplayName(connection);
+        const question = using.length
+            ? `Remove "${name}"? These entries in your list use it and will be removed too:\n\n${using.join("\n")}`
+            : `Remove "${name}"?`;
+        if (!window.confirm(question)) return;
+        removeConnection(connection.id);
+    };
+
+    return (
+        <SettingsSection title="Connections" description="Saved ways to reach a provider: a name you choose, the key, and the endpoint if it needs one. Type a key once and use it in as many entries as you like.">
+        {connections.map((connection) => {
+            const using = entries.filter((entry) => entry.connectionId === connection.id).length;
+            const selfHosted = providerSetupRequirement(connection.provider) === "endpoint";
+            return (
+                <div key={connection.id} style={{ ...listCardStyle, flexDirection: "column", alignItems: "stretch" }}>
+                <div style={{ alignItems: "center", display: "flex", gap: "0.5rem", justifyContent: "space-between" }}>
+                <div style={{ minWidth: 0, flex: 1 }}>
+                <div style={{ fontSize: "0.82rem", fontWeight: 650, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{connectionDisplayName(connection)}</div>
+                <div style={{ ...helperStyle, marginTop: "0.1rem" }}>
+                {getProviderMeta(connection.provider).label}
+                {selfHosted ? ` · ${connection.endpoint || "no endpoint"}` : ` · key ${connection.apiKey.trim() ? "set" : "not set"}`}
+                {` · used by ${using} entr${using === 1 ? "y" : "ies"}`}
+                </div>
+                </div>
+                <div style={{ display: "flex", gap: "0.3rem", flexShrink: 0 }}>
+                <button type="button" onClick={() => setEditingId(editingId === connection.id ? null : connection.id)} style={rowButtonStyle}>{editingId === connection.id ? "Done" : "Edit"}</button>
+                <button type="button" onClick={() => remove(connection)} aria-label="Remove" title="Remove connection" style={rowButtonStyle}>✕</button>
+                </div>
+                </div>
+                {editingId === connection.id && (
+                    <div style={{ marginTop: "0.75rem" }}>
+                    <ConnectionFields connection={connection} sharedBy={using} />
+                    </div>
+                )}
+                </div>
+            );
+        })}
+        <div style={{ display: "flex", gap: "0.4rem", flexWrap: "wrap", marginTop: "0.4rem" }}>
+        <button type="button" onClick={() => setEditingId(addConnection({ provider: DEFAULT_PROVIDER, name: "" }))} style={primaryButtonStyle}>+ New connection</button>
+        {CONNECTION_TEMPLATES.map((template) => (
+            <button key={template.name} type="button" onClick={() => setEditingId(addConnection(template))} style={smallButtonStyle}>+ {template.name}</button>
+        ))}
+        </div>
+        </SettingsSection>
+    );
+};
+
+// Per-task picks (ported from the abdulrahman-2005 fork's per-task routing):
+// a task can start at an entry of its own, then falls back through the list
+// from the top like every other call.
+const TaskPicks = () => {
+    const { entries } = useFallbackView();
+    const [expanded, setExpanded] = useState(false);
+    const [picks, setPicks] = useState(() => Object.fromEntries(AI_TASK_ROUTING.map(({ key }) => [key, getTaskPick(key)])));
+    const groups = [...new Set(AI_TASK_ROUTING.map((entry) => entry.group))];
+    const withConnection = entries.filter((entry) => entry.resolved);
+    const activeCount = Object.values(picks).filter((id) => withConnection.some((entry) => entry.id === id)).length;
+
+    const update = (key, entryId) => {
+        setPicks((current) => ({ ...current, [key]: entryId }));
+        setTaskPick(key, entryId);
+    };
+
+    return (
+        <div>
+        <button type="button" onClick={() => setExpanded((current) => !current)} style={{ ...smallButtonStyle, width: "100%", display: "flex", justifyContent: "space-between" }}>
         <span>Per-task models{activeCount ? ` (${activeCount} set)` : ""}</span>
         <span>{expanded ? "Hide" : "Show"}</span>
         </button>
         {expanded && (
             <div style={{ marginTop: "0.6rem" }}>
-            <div style={{ ...helperStyle, marginTop: 0, marginBottom: "0.7rem" }}>
-            Route individual AI tasks to a cheaper or a stronger model. Blank means the
-            default model above. Saved per provider, so switching providers switches the
-            whole set.
-            </div>
             {groups.map((group) => (
                 <div key={group}>
                 <div style={{ fontSize: "0.76rem", fontWeight: 700, opacity: 0.8, margin: "0.5rem 0 0.4rem" }}>{group}</div>
                 {AI_TASK_ROUTING.filter((entry) => entry.group === group).map(({ key, label, hint }) => (
-                    <SettingsInput
-                    key={key}
-                    label={label}
-                    value={overrides[key] ?? ""}
-                    onChange={(value) => update(key, value)}
-                    placeholder={hint}
-                    suggestions={suggestions}
-                    />
+                    <div key={key} style={fieldGroupStyle}>
+                    <label style={labelStyle}>{label}</label>
+                    <select data-no-translate value={withConnection.some((entry) => entry.id === picks[key]) ? picks[key] : ""} onChange={(event) => update(key, event.target.value)} style={{ ...inputStyle, cursor: "pointer" }}>
+                    <option value="" style={{ color: "black" }}>Start at the top of the list</option>
+                    {withConnection.map((entry, index) => (
+                        <option key={entry.id} value={entry.id} style={{ color: "black" }}>{index + 1}. {entry.resolved.label}</option>
+                    ))}
+                    </select>
+                    <div style={helperStyle}>{hint}</div>
+                    </div>
                 ))}
                 </div>
             ))}
@@ -744,39 +991,53 @@ const TaskModelOverrides = ({ provider, suggestions }) => {
     );
 };
 
-// Per-provider expert fields, keyed by the form-state names the settings host
-// persists (providerConfig.js FORM_FIELD_MAP).
-const PROVIDER_EXPERT_FIELDS = {
-    gemini: { customParams: "geminiCustomParams", placeholder: '{"generationConfig": {"topP": 0.9}}' },
-    openai: { customParams: "openaiCustomParams", placeholder: '{"top_p": 0.9}', structuredMode: "openaiStructuredMode" },
-    anthropic: { customParams: "anthropicCustomParams", placeholder: '{"top_p": 0.9}' },
-    "opencode-zen": {
-        customParams: "opencodeZenCustomParams",
-        placeholder: '{"top_p": 0.9}',
-        structuredMode: "opencodeZenStructuredMode",
-    },
-    "openai-compatible": {
-        customParams: "openaiCompatibleCustomParams",
-        placeholder: '{"top_p": 0.9}',
-        structuredMode: "openaiCompatibleStructuredMode",
-        toolStrict: "openaiCompatibleToolStrict",
-    },
-    "anthropic-compatible": {
-        customParams: "anthropicCompatibleCustomParams",
-        placeholder: '{"top_p": 0.9}',
-        structuredMode: "anthropicCompatibleStructuredMode",
-    },
+// Setup and billing belong to the connection, shared by its fallback entries.
+const OpenCodeZenHelp = ({ connection }) => {
+    const allowPaid = connection.allowPaid === true;
+    const linkStyle = { color: "#93c5fd" };
+    return <>
+        <div style={{ ...helperStyle, marginTop: 0, marginBottom: "1rem", color: "rgba(255,255,255,0.8)" }}>
+        <strong>First time? Start here</strong>
+        <ol style={{ paddingLeft: "1.3rem", lineHeight: 1.65 }}>
+        <li>Open <a href="https://opencode.ai/auth" target="_blank" rel="noopener noreferrer" style={linkStyle}>OpenCode Zen</a> and sign in (or create an account).</li>
+        <li>In your OpenCode workspace, open <strong>API Keys</strong>, choose <strong>Create API Key</strong>, give it a name such as <strong>Open Historia</strong>, and create it.</li>
+        <li>Copy the entire secret key and paste it into <strong>OpenCode Zen API Key</strong> below. This is not your password or the key's name. Keep it private; do not put it in screenshots or bug reports.</li>
+        <li>Leave <strong>Enable paid Zen models</strong> off. Add this connection to the <strong>Fallback list</strong>, then click <strong>Load models</strong> in its entry and choose a free model, or leave Model blank to automatically try a currently listed free model.</li>
+        <li>Settings save automatically in this browser. Return to the game and send a short message to your advisor to test the key. Loading the model list alone does not test your key or balance.</li>
+        </ol>
+        <p><strong>Go is not Zen credit.</strong> An OpenCode account key used with Go may also work for Zen's free models, but the Go subscription does not cover paid Zen requests. You do not need to enable paid models here to try the free ones. To use paid models, check Zen Billing, add credit if needed, set a spending limit, then explicitly enable and select a paid model below.</p>
+        <p><strong>Use the desktop app or your own local server.</strong> Zen currently blocks cross-origin browser requests (CORS), so the hosted website may not connect. Never use a public proxy to work around this with your key.</p>
+        <p>Free availability and limits can change. Some free providers may use prompts and replies to improve their models: do not send personal or confidential information. Check <a href="https://opencode.ai/docs/zen/#pricing" target="_blank" rel="noopener noreferrer" style={linkStyle}>pricing</a> and <a href="https://opencode.ai/docs/zen/#privacy" target="_blank" rel="noopener noreferrer" style={linkStyle}>privacy terms</a>.</p>
+        </div>
+        <div style={{ ...helperStyle, marginBottom: "0.85rem", overflowWrap: "anywhere" }}>Fixed API address: {OPENCODE_ZEN_ENDPOINT} — not the /zen/go/v1 subscription endpoint.</div>
+        <Toggle
+        label="Enable paid Zen models"
+        enabled={allowPaid}
+        onToggle={() => updateConnection(connection.id, { allowPaid: !allowPaid })}
+        />
+        <div style={{ ...helperStyle, marginTop: "-0.6rem", marginBottom: "0.85rem" }}>
+        Off by default. Turning this on allows explicitly selected paid models, including fallback entries and task picks, to spend Zen credit. Blank Model still auto-picks only a free model. Free labels follow Zen's model names and published offers, not a live price quote.
+        </div>
+        <details style={{ ...helperStyle, marginBottom: "0.85rem" }}>
+        <summary style={{ cursor: "pointer" }}>Not working? Quick fixes</summary>
+        <ul style={{ paddingLeft: "1.3rem", lineHeight: 1.65 }}>
+        <li><strong>Invalid API key:</strong> copy the full secret again. If it was revoked, create a new one. Never share it to get help.</li>
+        <li><strong>Insufficient balance:</strong> switch to a free model, or check Zen Billing. Paying for Go does not top up Zen.</li>
+        <li><strong>Rate limit / busy:</strong> wait and retry, or choose another free model. Free access is limited, not unlimited.</li>
+        <li><strong>Model not found / access denied:</strong> load the list again and check that the model is enabled in your OpenCode workspace.</li>
+        <li><strong>Failed to fetch / CORS:</strong> use the desktop app or your own local server; do not disable browser security or share your key with a proxy.</li>
+        </ul>
+        </details>
+    </>;
 };
 
-// Keep the beginner steps visible, not behind an advanced-settings disclosure.
-// Model discovery is a catalogue lookup, NOT proof that a key has credit/access.
-const OpenCodeZenConnection = ({ settings, onSettingChange, recentModels }) => {
+const OpenCodeZenModel = ({ entry, connection, recentModels }) => {
     const [models, setModels] = useState([]);
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState("");
     const request = useRef(null);
     useEffect(() => () => request.current?.abort(), []);
-    const allowPaid = settings.opencodeZenAllowPaid === "1";
+    const allowPaid = connection.allowPaid === true;
     const visibleModels = models.filter((model) => allowPaid || isZenFreeModel(model));
 
     const loadModels = async () => {
@@ -798,43 +1059,12 @@ const OpenCodeZenConnection = ({ settings, onSettingChange, recentModels }) => {
         }
     };
 
-    const linkStyle = { color: "#93c5fd" };
     return (
         <>
-        <div style={{ ...helperStyle, marginTop: 0, marginBottom: "1rem", color: "rgba(255,255,255,0.8)" }}>
-        <strong>First time? Start here</strong>
-        <ol style={{ paddingLeft: "1.3rem", lineHeight: 1.65 }}>
-        <li>Open <a href="https://opencode.ai/auth" target="_blank" rel="noopener noreferrer" style={linkStyle}>OpenCode Zen</a> and sign in (or create an account).</li>
-        <li>In your OpenCode workspace, open <strong>API Keys</strong>, choose <strong>Create API Key</strong>, give it a name such as <strong>Open Historia</strong>, and create it.</li>
-        <li>Copy the entire secret key and paste it into <strong>OpenCode Zen API Key</strong> below. This is not your password or the key's name. Keep it private; do not put it in screenshots or bug reports.</li>
-        <li>Leave <strong>Enable paid Zen models</strong> off. Click <strong>Load models</strong> and choose a free model, or leave Model blank to automatically try a currently listed free model.</li>
-        <li>Settings save automatically in this browser. Return to the game and send a short message to your advisor to test the key. Loading the model list alone does not test your key or balance.</li>
-        </ol>
-        <p><strong>Go is not Zen credit.</strong> An OpenCode account key used with Go may also work for Zen's free models, but the Go subscription does not cover paid Zen requests. You do not need to enable paid models here to try the free ones. To use paid models, check Zen Billing, add credit if needed, set a spending limit, then explicitly enable and select a paid model below.</p>
-        <p><strong>Use the desktop app or your own local server.</strong> Zen currently blocks cross-origin browser requests (CORS), so the hosted website may not connect. Never use a public proxy to work around this with your key.</p>
-        <p>Free availability and limits can change. Some free providers may use prompts and replies to improve their models: do not send personal or confidential information. Check <a href="https://opencode.ai/docs/zen/#pricing" target="_blank" rel="noopener noreferrer" style={linkStyle}>pricing</a> and <a href="https://opencode.ai/docs/zen/#privacy" target="_blank" rel="noopener noreferrer" style={linkStyle}>privacy terms</a>.</p>
-        </div>
-        <SettingsInput
-        label="OpenCode Zen API Key"
-        type="password"
-        value={settings.opencodeZenApiKey ?? ""}
-        onChange={(value) => onSettingChange("opencodeZenApiKey", value)}
-        placeholder="Paste the secret key from OpenCode → API Keys"
-        helperText="Stored only in this browser, like the other AI keys. Sent to OpenCode Zen directly, or through your own local game server when necessary."
-        />
-        <div style={{ ...helperStyle, marginBottom: "0.85rem", overflowWrap: "anywhere" }}>Fixed API address: {OPENCODE_ZEN_ENDPOINT} — not the /zen/go/v1 subscription endpoint.</div>
-        <Toggle
-        label="Enable paid Zen models"
-        enabled={allowPaid}
-        onToggle={() => onSettingChange("opencodeZenAllowPaid", allowPaid ? "" : "1")}
-        />
-        <div style={{ ...helperStyle, marginTop: "-0.6rem", marginBottom: "0.85rem" }}>
-        Off by default. Turning this on allows explicitly selected paid models, including per-task overrides, to spend Zen credit. Blank Model still auto-picks only a free model. Free labels follow Zen's model names and published offers, not a live price quote.
-        </div>
         <SettingsInput
         label="Model"
-        value={settings.opencodeZenModel ?? ""}
-        onChange={(value) => onSettingChange("opencodeZenModel", value)}
+        value={entry.model}
+        onChange={(value) => updateEntry(entry.id, { model: value })}
         suggestions={[...new Set([...visibleModels, ...recentModels.filter((model) => allowPaid || isZenFreeModel(model))])]}
         placeholder="Leave blank to auto-pick a free model"
         helperText="Supports Zen Chat Completions models such as Big Pickle, MiMo, DeepSeek, GLM, Kimi and MiniMax. Models requiring Responses, Claude/Qwen Messages or Gemini APIs are not supported here yet."
@@ -842,7 +1072,7 @@ const OpenCodeZenConnection = ({ settings, onSettingChange, recentModels }) => {
         <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap", marginBottom: "0.85rem" }}>
         <button type="button" disabled={loading} onClick={loadModels} style={primaryButtonStyle}>{loading ? "Loading models…" : "Load models"}</button>
         {visibleModels.length > 0 && (
-            <select aria-label="Choose an OpenCode Zen model" style={{ ...inputStyle, flex: 1, minWidth: "12rem" }} value="" onChange={(event) => onSettingChange("opencodeZenModel", event.target.value)}>
+            <select aria-label="Choose an OpenCode Zen model" style={{ ...inputStyle, flex: 1, minWidth: "12rem" }} value="" onChange={(event) => updateEntry(entry.id, { model: event.target.value })}>
             <option value="" disabled>Choose a model…</option>
             {[false, true].filter((paid) => !paid || allowPaid).map((paid) => (
                 <optgroup key={String(paid)} label={paid ? "Paid — uses Zen credit" : "Free tier"}>
@@ -853,238 +1083,183 @@ const OpenCodeZenConnection = ({ settings, onSettingChange, recentModels }) => {
         )}
         </div>
         {error && <div role="alert" style={{ ...helperStyle, color: "#fca5a5", marginBottom: "0.85rem" }}>{error}</div>}
-        <details style={{ ...helperStyle, marginBottom: "0.85rem" }}>
-        <summary style={{ cursor: "pointer" }}>Not working? Quick fixes</summary>
-        <ul style={{ paddingLeft: "1.3rem", lineHeight: 1.65 }}>
-        <li><strong>Invalid API key:</strong> copy the full secret again. If it was revoked, create a new one. Never share it to get help.</li>
-        <li><strong>Insufficient balance:</strong> switch to a free model, or check Zen Billing. Paying for Go does not top up Zen.</li>
-        <li><strong>Rate limit / busy:</strong> wait and retry, or choose another free model. Free access is limited, not unlimited.</li>
-        <li><strong>Model not found / access denied:</strong> load the list again and check that the model is enabled in your OpenCode workspace.</li>
-        <li><strong>Failed to fetch / CORS:</strong> use the desktop app or your own local server; do not disable browser security or share your key with a proxy.</li>
-        </ul>
-        </details>
         </>
     );
 };
 
-// The connection: where the provider is and what runs there. Everything a
-// player touches once (credentials, model, profiles, reasoning) lives here;
-// request parameters, the structured-output ladder and per-task routing are
-// in the Advanced section so routine setup stays readable.
-const ProviderConnectionPanel = ({ provider, settings, onSettingChange }) => {
-    const meta = getProviderMeta(provider);
-    const supportsModelDiscovery = providerSupportsModelDiscovery(provider);
-    const recentModels = getRecentModels(provider);
-    // Global reasoning toggle — one switch, applied in every provider mode.
+// The global reasoning switch: one toggle, applied in every provider mode.
+const ReasoningSection = () => {
     const [reasoningOn, setReasoningOn] = useState(() => getReasoningEnabled());
     const toggleReasoning = () => {
         const next = !reasoningOn;
         setReasoningOn(next);
         setReasoningEnabled(next);
     };
-
     return (
-        <SettingsSection title={`${meta.label} connection`} description={meta.description}>
-        <PresetManager key={provider} provider={provider} settings={settings} onSettingChange={onSettingChange} />
-
-        {provider === "gemini" && (
-            <>
-            <SettingsInput
-            label="Gemini API Key"
-            type="password"
-            value={settings.geminiApiKey ?? ""}
-            onChange={(value) => onSettingChange("geminiApiKey", value)}
-            placeholder="Paste Gemini API key"
-            helperText="Stored only in this browser."
-            />
-            <SettingsInput
-            label="Model"
-            value={settings.geminiModel ?? ""}
-            onChange={(value) => onSettingChange("geminiModel", value)}
-            suggestions={recentModels}
-            placeholder="gemini-3.5-flash-lite"
-            helperText="Leave blank to use the built-in Gemini default."
-            />
-            </>
-        )}
-
-        {provider === "openai" && (
-            <>
-            <SettingsInput
-            label="OpenAI API Key"
-            type="password"
-            value={settings.openaiApiKey ?? ""}
-            onChange={(value) => onSettingChange("openaiApiKey", value)}
-            placeholder="Paste OpenAI API key"
-            helperText="Stored only in this browser."
-            />
-            <SettingsInput
-            label="Model"
-            value={settings.openaiModel ?? ""}
-            onChange={(value) => onSettingChange("openaiModel", value)}
-            suggestions={recentModels}
-            placeholder="gpt-..."
-            helperText={
-                supportsModelDiscovery
-                    ? "Leave blank to auto-pick a chat-capable model from /v1/models."
-                    : "Enter the exact model id."
-            }
-            />
-            </>
-        )}
-
-        {provider === "anthropic" && (
-            <>
-            <SettingsInput
-            label="Anthropic API Key"
-            type="password"
-            value={settings.anthropicApiKey ?? ""}
-            onChange={(value) => onSettingChange("anthropicApiKey", value)}
-            placeholder="Paste Anthropic API key"
-            helperText="Stored only in this browser."
-            />
-            <SettingsInput
-            label="Model"
-            value={settings.anthropicModel ?? ""}
-            onChange={(value) => onSettingChange("anthropicModel", value)}
-            suggestions={recentModels}
-            placeholder="claude-haiku-4-5"
-            helperText="Claude model ids are manual here. Leave blank to use the built-in default."
-            />
-            </>
-        )}
-
-        {provider === "opencode-zen" && (
-            <OpenCodeZenConnection settings={settings} onSettingChange={onSettingChange} recentModels={recentModels} />
-        )}
-
-        {provider === "openai-compatible" && (
-            <>
-            <SettingsInput
-            label="API Endpoint"
-            value={settings.openaiCompatibleEndpoint ?? ""}
-            onChange={(value) => onSettingChange("openaiCompatibleEndpoint", value)}
-            placeholder="http://localhost:11434/v1"
-            // A server on the player's own machine works from the website too, but only
-            // if it allows this origin — otherwise the browser silently drops the reply.
-            // Say so up front here rather than letting it surface as "Failed to fetch".
-            helperText={import.meta.env.VITE_OH_WEB
-                ? "Base URL that exposes /chat/completions and /models. A server on your own machine (Ollama, LM Studio) also has to allow this site: start Ollama with OLLAMA_ORIGINS set to this site's address, or use the desktop app."
-                : "Base URL that exposes /chat/completions and /models."}
-            />
-            <SettingsInput
-            label="API Key (optional)"
-            type="password"
-            value={settings.openaiCompatibleApiKey ?? ""}
-            onChange={(value) => onSettingChange("openaiCompatibleApiKey", value)}
-            placeholder="Leave empty for local Ollama"
-            helperText="Use a bearer token if your gateway requires authentication."
-            />
-            <SettingsInput
-            label="Model"
-            value={settings.openaiCompatibleModel ?? ""}
-            onChange={(value) => onSettingChange("openaiCompatibleModel", value)}
-            suggestions={recentModels}
-            placeholder="llama / qwen / gpt / mistral"
-            helperText="Leave blank to auto-pick a model from /models."
-            />
-            </>
-        )}
-
-        {provider === "anthropic-compatible" && (
-            <>
-            <SettingsInput
-            label="API Endpoint"
-            value={settings.anthropicCompatibleEndpoint ?? ""}
-            onChange={(value) => onSettingChange("anthropicCompatibleEndpoint", value)}
-            placeholder="https://my-proxy.example/v1"
-            helperText="Base URL of a self-hosted proxy that speaks the Anthropic Messages API (POST /messages). Routed through the game server to avoid CORS."
-            />
-            <SettingsInput
-            label="API Key (optional)"
-            type="password"
-            value={settings.anthropicCompatibleApiKey ?? ""}
-            onChange={(value) => onSettingChange("anthropicCompatibleApiKey", value)}
-            placeholder="Sent as x-api-key if set"
-            helperText="Leave empty if your proxy doesn't require a key."
-            />
-            <SettingsInput
-            label="Model"
-            value={settings.anthropicCompatibleModel ?? ""}
-            onChange={(value) => onSettingChange("anthropicCompatibleModel", value)}
-            suggestions={recentModels}
-            placeholder="claude-haiku-4-5"
-            helperText="The model id your proxy expects. Leave blank to use the built-in default."
-            />
-            </>
-        )}
-
-        <div style={{ borderTop: "1px solid rgba(255,255,255,0.07)", marginTop: "0.35rem", paddingTop: "0.8rem" }}>
-        <Toggle
-        label="Model reasoning"
-        enabled={reasoningOn}
-        onToggle={toggleReasoning}
-        />
+        <SettingsSection title="Model reasoning" description="Applies to every model in the list.">
+        <Toggle label="Model reasoning" enabled={reasoningOn} onToggle={toggleReasoning} />
         <div style={{ ...helperStyle, marginTop: "-0.6rem", marginBottom: 0 }}>
         Lets thinking-capable models reason before answering (Gemini thinking, OpenAI
         reasoning effort, Claude extended thinking). Slower and costs more tokens;
         needs a model that supports it.
         </div>
-        </div>
         </SettingsSection>
     );
 };
 
-// Expert controls for the active provider: the request-body escape hatch, the
-// structured-output ladder (structuredMode.js) and the strict tool schema.
-const ProviderAdvancedPanel = ({ provider, settings, onSettingChange, onOpenAiSettings }) => {
-    const meta = getProviderMeta(provider);
-    const field = PROVIDER_EXPERT_FIELDS[provider] ?? PROVIDER_EXPERT_FIELDS[DEFAULT_PROVIDER];
+// The request budget (AI/requestBudget.js): what today has cost, and the
+// switches that decide what a time skip and an idle minute may spend. Its own
+// storage and its own change event, so it sits outside mapSettings.
+const REVIEW_SECTION_LABELS = {
+    units: ["Move units to match the events", "Armies advance, retreat and take losses where the events say they did."],
+    territory: ["Mark occupied and disputed land", "Captured towns change hands on the map; contested ones are striped."],
+    timeline: ["Take repeats and filler off the timeline", "Events that restate the record, or report a meeting with no outcome, are left out."],
+    board: ["Keep the Projects board in step", "Progress, stalls and new long-term efforts follow from what happened."],
+    spies: ["Collect your agents' reports", "Each agent files what it intercepted, at least every third skip."],
+};
+
+const useRequestDay = () => {
+    const [day, setDay] = useState(() => requestDay());
+    useEffect(() => {
+        const refresh = () => setDay(requestDay());
+        window.addEventListener("ai:request-budget", refresh);
+        // The day turns over at midnight Pacific whether or not anything is sent.
+        const timer = setInterval(refresh, 60000);
+        return () => {
+            window.removeEventListener("ai:request-budget", refresh);
+            clearInterval(timer);
+        };
+    }, []);
+    return day;
+};
+
+const RequestBudgetSection = () => {
+    const day = useRequestDay();
+    const [saving, setSaving] = useState(() => requestSettings.saveRequests());
+    const [background, setBackground] = useState(() => requestSettings.backgroundAi());
+    const [dailyLimit, setDailyLimit] = useState(() => String(requestSettings.dailyLimit()));
+    const [backgroundCap, setBackgroundCap] = useState(() => String(requestSettings.backgroundDailyCap()));
+    const [sections, setSections] = useState(() => Object.fromEntries(REVIEW_SECTIONS.map((section) => [section, requestSettings.reviewSection(section)])));
+
+    const apply = (message, write) => {
+        write();
+        logDebugEvent("setting", message);
+        announceRequestBudgetChange();
+    };
+    const cost = describeJumpCost({ saveRequests: saving });
+    const share = day.limit > 0 ? Math.min(1, day.used / day.limit) : 0;
+    const barColor = share >= 0.9 ? "#f87171" : share >= 0.7 ? "#fbbf24" : "#60a5fa";
 
     return (
         <SettingsSection
-        title="Custom request parameters"
-        description={`Active provider: ${meta.label}. These values go straight to the provider and should normally be left empty.`}
-        right={(
-            <button
-            type="button"
-            onClick={onOpenAiSettings}
-            style={{ background: "rgba(59,130,246,0.12)", border: "1px solid rgba(96,165,250,0.24)", borderRadius: "8px", color: "#bfdbfe", cursor: "pointer", fontSize: "0.72rem", fontWeight: 750, padding: "0.45rem 0.65rem" }}
-            >
-            AI settings
-            </button>
-        )}
+        title="AI requests"
+        description="A free key allows a few hundred requests a day. These settings decide how many the game spends, and on what."
         >
-        <SettingsInput
-        label="Custom parameters (JSON)"
-        multiline
-        value={settings[field.customParams] ?? ""}
-        onChange={(value) => onSettingChange(field.customParams, value)}
-        placeholder={field.placeholder}
-        helperText="Optional. Merged into the request body — e.g. to limit reasoning budget/effort. Invalid JSON is ignored."
-        />
-        {field.structuredMode && (
-            <StructuredModeSelect
-            value={settings[field.structuredMode] ?? "auto"}
-            onChange={(value) => onSettingChange(field.structuredMode, value)}
-            />
-        )}
-        {field.toolStrict && (
-            <>
-            <Toggle
-            label="Strict tool schema"
-            enabled={settings[field.toolStrict] === "1"}
-            onToggle={() => onSettingChange(field.toolStrict, settings[field.toolStrict] === "1" ? "" : "1")}
-            />
-            <div style={{ ...helperStyle, marginTop: "-0.6rem" }}>
-            Sends strict:true with the tool call so a self-hosted backend constrains
-            generation to the schema (SGLang/xgrammar, vLLM). Stops malformed or
-            mistyped tool arguments. Leave off for OpenAI and Azure: they reject a
-            schema that does not list every property as required. Only affects the
-            tool rung of the structured-output ladder above.
+            <div style={{ marginBottom: "0.95rem" }}>
+                <div style={{ alignItems: "baseline", display: "flex", gap: "0.5rem", justifyContent: "space-between" }}>
+                    <div style={{ color: "rgba(255,255,255,0.92)", fontSize: "0.82rem", fontWeight: 800 }}>
+                        <span data-no-translate>{day.used}</span> of <span data-no-translate>{day.limit}</span> used today
+                    </div>
+                    <div style={{ color: "rgba(255,255,255,0.4)", fontSize: "0.64rem" }}>
+                        resets at <span data-no-translate>{formatResetTime(day.resetAt)}</span>
+                    </div>
+                </div>
+                <div style={{ background: "rgba(255,255,255,0.07)", borderRadius: "999px", height: "6px", marginTop: "0.4rem", overflow: "hidden" }}>
+                    <div style={{ background: barColor, height: "100%", width: `${Math.round(share * 100)}%` }} />
+                </div>
+                <div style={{ ...helperStyle, marginTop: "0.4rem" }}>
+                    {day.lastJump ? <>Your last time skip used <span data-no-translate>{day.lastJump.used}</span>. </> : null}
+                    {day.background > 0 ? <>Background AI has used <span data-no-translate>{day.background}</span> of its <span data-no-translate>{day.backgroundCap}</span>. </> : null}
+                    {day.refused > 0 ? <>The provider turned away <span data-no-translate>{day.refused}</span> for coming too fast; those cost a wait, not allowance. </> : null}
+                    Counted on this device, from midnight Pacific time, which is when a Gemini key&apos;s day begins.
+                </div>
             </div>
-            </>
-        )}
+
+            <Toggle
+            label="Save AI requests"
+            enabled={saving}
+            onToggle={() => {
+                const next = !saving;
+                setSaving(next);
+                apply(`Save AI requests turned ${next ? "on" : "off"}.`, () => requestSettings.setSaveRequests(next));
+            }}
+            />
+            <div style={settingsHelper}>
+                {saving
+                    ? <>On (default): a time skip is one request, two when there is something to check afterwards, and never more than <span data-no-translate>{cost.max}</span>. The model is handed the names it needs instead of looking them up, a small mistake in its answer is cut out rather than asked for again, and the checks below go out together.</>
+                    : <>Off: the most thorough turns, for a key with no daily limit. Every check after a skip makes its own request, the model may look things up (up to three extra requests per task), and a flawed answer is sent back to be redone. A busy skip can use twenty requests or more.</>}
+            </div>
+
+            <div style={fieldGroupStyle}>
+                <label style={labelStyle} htmlFor="ai-daily-request-limit">Requests a day your key allows</label>
+                <input
+                id="ai-daily-request-limit"
+                data-no-translate
+                inputMode="numeric"
+                style={{ ...inputStyle, maxWidth: "9rem" }}
+                value={dailyLimit}
+                onChange={(event) => setDailyLimit(event.target.value.replace(/[^\d]/g, ""))}
+                onBlur={() => {
+                    apply(`Daily request limit set to ${dailyLimit || "the default"}.`, () => requestSettings.setDailyLimit(dailyLimit));
+                    setDailyLimit(String(requestSettings.dailyLimit()));
+                }}
+                />
+                <div style={helperStyle}>Only used for the count above and to keep background AI from spending the end of your day. The game never stops you at the limit; your provider does.</div>
+            </div>
+
+            <Toggle
+            label="Background AI"
+            enabled={background}
+            onToggle={() => {
+                const next = !background;
+                setBackground(next);
+                apply(`Background AI turned ${next ? "on" : "off"}.`, () => requestSettings.setBackgroundAi(next));
+            }}
+            />
+            <div style={settingsHelper}>
+                {background
+                    ? <>On (default): while you are not skipping time, countries may write to you unprompted, forces may reposition, agents may file extra reports, and a country you look at gets its first intelligence reading — each of those is a request nobody pressed a button for, and together they stop at the daily cap below.</>
+                    : <>Off: the game only calls the model when you do something.</>}
+            </div>
+            {background && (
+                <div style={fieldGroupStyle}>
+                    <label style={labelStyle} htmlFor="ai-background-daily-cap">Background requests a day, at most</label>
+                    <input
+                    id="ai-background-daily-cap"
+                    data-no-translate
+                    inputMode="numeric"
+                    style={{ ...inputStyle, maxWidth: "9rem" }}
+                    value={backgroundCap}
+                    onChange={(event) => setBackgroundCap(event.target.value.replace(/[^\d]/g, ""))}
+                    onBlur={() => {
+                        apply(`Background AI daily cap set to ${backgroundCap || "the default"}.`, () => requestSettings.setBackgroundDailyCap(backgroundCap));
+                        setBackgroundCap(String(requestSettings.backgroundDailyCap()));
+                    }}
+                    />
+                    <div style={helperStyle}>It also stops by itself once less than a tenth of your day is left.</div>
+                </div>
+            )}
+
+            <div style={{ color: "rgba(255,255,255,0.78)", fontSize: "0.74rem", fontWeight: 800, margin: "0.4rem 0 0.2rem" }}>Checks after a time skip</div>
+            <div style={{ ...helperStyle, marginBottom: "0.7rem" }}>
+                {saving
+                    ? "All of these share ONE request, and only when the skip gave them something to look at. Turning one off never saves a request unless it was the only one with work to do; it does make that request smaller."
+                    : "With Save AI requests off, each of these is its own request after every skip and these switches are not used."}
+            </div>
+            {REVIEW_SECTIONS.map((section, index) => (
+                <React.Fragment key={section}>
+                    <Toggle
+                    label={REVIEW_SECTION_LABELS[section][0]}
+                    enabled={sections[section]}
+                    onToggle={() => {
+                        const next = !sections[section];
+                        setSections((current) => ({ ...current, [section]: next }));
+                        apply(`After-skip check "${REVIEW_SECTION_LABELS[section][0]}" turned ${next ? "on" : "off"}.`, () => requestSettings.setReviewSection(section, next));
+                    }}
+                    />
+                    <div style={{ ...settingsHelper, ...(index === REVIEW_SECTIONS.length - 1 ? { marginBottom: 0 } : {}) }}>{REVIEW_SECTION_LABELS[section][1]}</div>
+                </React.Fragment>
+            ))}
         </SettingsSection>
     );
 };
@@ -1207,6 +1382,7 @@ const NetworkSharing = () => {
             const data = await response.json();
             if (!response.ok) throw new Error(data?.error || "Could not change this.");
             setState(data);
+            logSettingChange("Let other devices connect", Boolean(data?.lanEnabled));
         } catch (nextError) {
             setError(nextError.message);
         } finally {
@@ -1278,6 +1454,96 @@ const NetworkSharing = () => {
     );
 };
 
+// Settings → Diagnostics → View log: the Logging file's entries, newest first,
+// so a player can look before they send — the page's own and, on desktop, the
+// desktop app's and server's, exactly as the file would hold them
+// (getLoggingFileEntries). Read once on opening and on Refresh rather than live:
+// the Desktop log is a request away, and a list that reorders under the reader
+// while a turn runs cannot be read.
+const DiagnosticsLogViewer = () => {
+    const [shown, setShown] = useState(null);
+    const [desktopStatus, setDesktopStatus] = useState("");
+    const [onlyProblems, setOnlyProblems] = useState(false);
+    const [expanded, setExpanded] = useState(null);
+
+    const show = (desktop) => {
+        setDesktopStatus(desktop.status);
+        setShown(getLoggingFileEntries({ desktop }));
+        setExpanded(null);
+    };
+    const load = () => fetchDesktopLog().then(show);
+
+    // Read once on opening. `cancelled` because the menu can close before the
+    // Desktop log answers.
+    useEffect(() => {
+        let cancelled = false;
+        fetchDesktopLog().then((desktop) => { if (!cancelled) show(desktop); });
+        return () => { cancelled = true; };
+    }, []);
+
+    const entries = (shown ?? []).filter((entry) => !onlyProblems || entry.problem);
+
+    return (
+        <div style={{ marginBottom: "0.8rem" }}>
+        <div style={{ display: "flex", gap: "0.5rem", marginBottom: "0.4rem" }}>
+        <button type="button" onClick={load} style={{ ...diagnosticsButton, flex: 1 }}>Refresh</button>
+        <button type="button" onClick={() => setOnlyProblems((value) => !value)} style={{ ...diagnosticsButton, flex: 1 }}>
+        {onlyProblems ? "Showing problems only" : "Showing everything"}
+        </button>
+        </div>
+        {desktopStatus === "unavailable" && (
+            <div style={{ fontSize: "0.68rem", color: "rgba(255,200,97,0.8)", marginBottom: "0.4rem" }}>
+            The desktop app&apos;s own entries could not be read just now.
+            </div>
+        )}
+        <div style={{ maxHeight: "18rem", overflowY: "auto", border: "1px solid rgba(255,255,255,0.1)", borderRadius: "6px" }}>
+        {shown === null && <div style={viewerNoteStyle}>Reading the log…</div>}
+        {shown !== null && entries.length === 0 && (
+            <div style={viewerNoteStyle}>{onlyProblems ? "No problems logged." : "Nothing logged yet."}</div>
+        )}
+        {entries.map((entry, index) => (
+            <div key={`${entry.at}-${index}`} style={{ borderBottom: "1px solid rgba(255,255,255,0.06)", padding: "0.3rem 0.45rem" }}>
+            <div
+            onClick={() => entry.detail && setExpanded(expanded === index ? null : index)}
+            style={{ cursor: entry.detail ? "pointer" : "default", display: "flex", gap: "0.45rem", fontSize: "0.72rem", alignItems: "baseline" }}
+            >
+            <span style={{ color: "rgba(255,255,255,0.4)", whiteSpace: "nowrap" }}>{String(entry.at || "").slice(11, 19)}</span>
+            <span style={{ color: entry.problem ? "#ffb35c" : "rgba(255,255,255,0.55)", fontWeight: 700, whiteSpace: "nowrap" }}>{entry.category}</span>
+            <span style={{ color: "#fff", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1 }}>
+            {entry.message}{entry.repeat > 1 ? ` (×${entry.repeat})` : ""}
+            </span>
+            {entry.detail && <span style={{ color: "rgba(255,255,255,0.35)" }}>{expanded === index ? "▾" : "▸"}</span>}
+            </div>
+            {expanded === index && (
+                <pre style={{
+                    background: "rgba(0,0,0,0.35)", borderRadius: 6, color: "rgba(255,255,255,0.8)",
+                    fontSize: "0.68rem", margin: "0.3rem 0 0", maxHeight: "12rem", overflow: "auto", padding: "0.45rem",
+                    whiteSpace: "pre-wrap", wordBreak: "break-word",
+                }}>{entry.detail}</pre>
+            )}
+            </div>
+        ))}
+        </div>
+        </div>
+    );
+};
+
+const viewerNoteStyle = { padding: "0.6rem", fontSize: "0.72rem", color: "rgba(255,255,255,0.45)" };
+
+// The button picks its own game — whichever is being played — so both the tooltip
+// and the result name it. A campaign name can be long; the button is one line.
+const IDLE_ATTACH = { kind: "idle" };
+const shortGameName = (name) => {
+    const text = String(name ?? "").trim();
+    return text.length > 28 ? `${text.slice(0, 27)}…` : text;
+};
+const attachGameTitle = (loggingOn, gameName) => {
+    const which = gameName ? `“${gameName}”` : "the game you are playing";
+    return loggingOn
+        ? `Saves the log file, then ${which} as a .zip. Send both with the report: the log says what happened, the game is what it happened to.`
+        : `Logging is off, so there is no log to save — this saves ${which} as a .zip.`;
+};
+
 // Settings → Advanced → Diagnostics: the log a player pastes into a bug report.
 //
 // Two ways out, because the two report routes want different things. Copy is for
@@ -1296,6 +1562,11 @@ const NetworkSharing = () => {
 const DiagnosticsPanel = () => {
     const [copyState, setCopyState] = useState("idle");
     const [cleared, setCleared] = useState(false);
+    const [viewing, setViewing] = useState(false);
+    const [attachState, setAttachState] = useState(IDLE_ATTACH);
+    // Read at render rather than subscribed: this panel is remounted every time the
+    // settings menu opens, and the name only has to be right when it is on screen.
+    const activeGameName = String(getLibraryState().activeGame?.name ?? "").trim();
     // The count is the whole reason this section is visible when nothing is
     // wrong: "Entries: 0" after a crash means the log is not recording and the
     // player should say so, rather than pasting an empty report.
@@ -1332,23 +1603,52 @@ const DiagnosticsPanel = () => {
         // Through the shared helper: navigator.clipboard needs a secure context
         // and a browser reaching this game over plain http on the LAN (Settings →
         // Network) does not have one. Same reason clipboard.js exists at all.
-        const ok = await copyToClipboard(buildDebugLogReport());
+        const ok = await copyToClipboard(await buildLoggingFile());
         setCopyState(ok ? "copied" : "failed");
         setTimeout(() => setCopyState("idle"), 2500);
     };
 
-    const handleDownload = () => {
-        const blob = new Blob([buildDebugLogReport()], { type: "text/plain;charset=utf-8" });
-        const url = URL.createObjectURL(blob);
-        const link = document.createElement("a");
-        link.href = url;
-        link.download = debugLogFilename();
-        document.body.appendChild(link);
-        link.click();
-        link.remove();
-        // Revoked on the next tick, not immediately: Firefox cancels a download
-        // whose blob URL is revoked in the same task as the click.
-        setTimeout(() => URL.revokeObjectURL(url), 1000);
+    // The same save the failure buttons use. Where no file can be saved (the
+    // Android app) it copies instead, and says so on the Copy button beside it.
+    const handleDownload = async () => {
+        if (await saveDebugLogFile() !== "copied") return;
+        setCopyState("copied");
+        setTimeout(() => setCopyState("idle"), 2500);
+    };
+
+    // Two files, deliberately, and the .txt first. GitHub and Discord both preview
+    // a .txt inline, so a maintainer reads the log without downloading anything;
+    // a log zipped in beside the game would be a file nobody opens. Hidden on
+    // Android, where the WebView cannot save a file at all (saveDebugLog.js) and
+    // a 4 MB zip has no clipboard to fall back to.
+    const handleAttachGame = async () => {
+        const { activeGame, activeGameId: gameId } = getLibraryState();
+        if (!gameId) {
+            setAttachState({ kind: "no game" });
+            setTimeout(() => setAttachState(IDLE_ATTACH), 2500);
+            return;
+        }
+
+        // The name, because this button picks its own game — whichever one is being
+        // played, which is not necessarily the one the player was last looking at in
+        // the library. Saying which was saved is the difference between a file they
+        // can send with confidence and one they have to go and check.
+        const name = String(activeGame?.name ?? "").trim() || gameId;
+
+        setAttachState({ kind: "working" });
+        try {
+            // With logging off there is no log to send — saving an empty one would
+            // be a file that says nothing, and the button above already says the
+            // same thing by being dimmed. Just the game, and the label says so.
+            if (enabled) await saveDebugLogFile();
+            const { blob } = await buildGameZipBlob(gameId);
+            saveGameZipToDisk(blob, `${gameId}-game.zip`);
+            setAttachState({ kind: "saved", name, size: formatZipSize(blob.size) });
+        } catch (error) {
+            logDebugEvent("diagnostics", "Saving the game failed.", { error: error?.message || String(error) });
+            setAttachState({ kind: "failed" });
+        }
+        setTimeout(() => setAttachState(IDLE_ATTACH), 4000);
     };
 
     const handleClear = () => {
@@ -1360,7 +1660,7 @@ const DiagnosticsPanel = () => {
     return (
         <div>
         <div style={{ marginBottom: "0.55rem", fontSize: "0.72rem", color: "rgba(255,255,255,0.45)", lineHeight: 1.35 }}>
-        The game keeps a running log of what you did — saves opened, orders queued, turns taken, and anything that went wrong. Send it with a bug report and it says what happened, in order.
+        The game keeps a running log of what you did — saves opened, orders queued, turns taken, and anything that went wrong. Send it with a bug report and it says what happened, in order. Saving it with the game attaches the campaign it happened in, which is what lets a fix be tested against it.
         </div>
 
         <div style={{ display: "flex", gap: "0.5rem", marginBottom: "0.5rem", opacity: enabled ? 1 : 0.45 }}>
@@ -1373,9 +1673,41 @@ const DiagnosticsPanel = () => {
         {copyState === "copied" ? "✓ Copied!" : copyState === "failed" ? "Couldn't copy" : copyState === "copying" ? "Copying…" : "📋 Copy log"}
         </button>
         <button type="button" onClick={handleDownload} style={{ ...diagnosticsButton, flex: 1 }}>
-        💾 Save as file
+        💾 Save log file
         </button>
         </div>
+
+        {/* The save itself as a second file, for a report a maintainer has to
+            reproduce: the log fingerprints the prompts, the game is what a prompt
+            can be rebuilt from. */}
+        {!isNativeApp() && (
+        <button
+        type="button"
+        onClick={handleAttachGame}
+        disabled={attachState.kind === "working"}
+        style={{ ...diagnosticsButton, width: "100%", marginBottom: "0.5rem" }}
+        title={attachGameTitle(enabled, activeGameName)}
+        >
+        {attachState.kind === "working"
+            ? "Packing the game…"
+            : attachState.kind === "no game"
+            ? "No game open"
+            : attachState.kind === "failed"
+            ? "Couldn't save the game"
+            : attachState.kind === "saved"
+            ? `✓ Saved ${enabled ? "log + " : ""}“${shortGameName(attachState.name)}” (${attachState.size})`
+            : enabled ? "💾 Save log file + game" : "💾 Save game"}
+        </button>
+        )}
+
+        <button
+        type="button"
+        onClick={() => setViewing((value) => !value)}
+        style={{ ...diagnosticsButton, width: "100%", marginBottom: "0.5rem" }}
+        >
+        {viewing ? "Hide log" : "🔎 View log"}
+        </button>
+        {viewing && <DiagnosticsLogViewer />}
 
         <div style={{ alignItems: "center", display: "flex", gap: "0.5rem", justifyContent: "space-between" }}>
         <span style={{ fontSize: "0.7rem", color: "rgba(255,255,255,0.4)" }}>
@@ -1408,7 +1740,7 @@ const DiagnosticsPanel = () => {
 
         <Toggle label="Keep a diagnostics log" enabled={enabled} onToggle={toggleEnabled} />
         <div style={helperTextStyle}>
-        On by default. Off: nothing is recorded, and the log stored on this device is deleted. Remembered across save changes and restarts.
+        On by default. Off: nothing is recorded and the log on this device is deleted. The desktop app still notes its own start-up and server errors, which never include your campaign. Remembered across save changes and restarts.
         </div>
 
         <Toggle label="Detailed logging" enabled={verbose} onToggle={toggleVerbose} />
@@ -1426,7 +1758,7 @@ const DiagnosticsPanel = () => {
         <li>The game&apos;s routine console messages</li>
         </ul>
         <div style={{ marginTop: "0.3rem" }}>
-        The log gets a bigger allowance while this is on, but still fills faster. It now quotes your conversations word for word — read it before posting it somewhere public.
+        The log fills much faster while this is on, so it reaches less far back. It quotes your conversations word for word — read it before posting it somewhere public.
         </div>
         </div>
 
@@ -1531,8 +1863,8 @@ const settingsHelper = { ...helperStyle, marginTop: "-0.55rem", marginBottom: "0
 const SETTINGS_SECTIONS = [
     { key: "general", label: "General", icon: "◫", description: "Language, display and accessibility" },
     { key: "map", label: "Map", icon: "◇", description: "Basemap, labels, globe and camera" },
-    { key: "ai", label: "AI", icon: "✦", description: "Provider, model, reasoning and limits" },
-    { key: "advanced", label: "Advanced", icon: "⌘", description: "Provider parameters and expert controls" },
+    { key: "ai", label: "AI", icon: "✦", description: "Models, backups, keys and reasoning" },
+    { key: "advanced", label: "Advanced", icon: "⌘", description: "Per-task models and expert controls" },
 ];
 
 // The small menu becoming the workspace. `fromRect` is the small menu's card
@@ -1589,15 +1921,12 @@ const SettingsWorkspace = ({
     onToggleFullscreen,
     onToggleGlobe,
     onToggleTerrain,
-    selectedProvider,
-    onApiProviderChange,
-    providerSettings,
-    onProviderSettingChange,
     mapSettings,
     updateMapSetting,
     basemapStyle,
     updateBasemapStyle,
-    updateBetaUnits,
+    labelFont,
+    updateLabelFont,
     telemetryOn,
     onToggleTelemetry,
     ratingOn,
@@ -1704,6 +2033,26 @@ const SettingsWorkspace = ({
                         </select>
                         <div style={helperStyle}>Scenario default uses the map chosen by the scenario author. Overrides apply immediately.</div>
                     </div>
+                    {/* Labels rasterize from the player's LOCAL fonts (the style
+                        has no glyph server), so any installed family works - the
+                        list only suggests common safe ones. Empty = whatever the
+                        scenario set, which itself defaults to Georgia. */}
+                    <div style={fieldGroupStyle}>
+                        <label style={labelStyle} htmlFor="game-label-font">Country label font</label>
+                        <input
+                        id="game-label-font"
+                        data-no-translate
+                        list="oh-settings-label-font-options"
+                        placeholder="Scenario default"
+                        style={inputStyle}
+                        value={labelFont}
+                        onChange={(event) => updateLabelFont(event.target.value)}
+                        />
+                        <datalist id="oh-settings-label-font-options">
+                            {LABEL_FONT_SUGGESTIONS.map((font) => <option key={font} value={font} />)}
+                        </datalist>
+                        <div style={helperStyle}>Empty uses the font the scenario author chose. Any font installed on this computer works; overrides apply immediately.</div>
+                    </div>
                     <Toggle label="Hide country labels" enabled={mapSettings.hideCountryLabels} onToggle={() => updateMapSetting("hideCountryLabels", MAP_SETTING_KEYS.hideCountryLabels, !mapSettings.hideCountryLabels)} />
                 </SettingsSection>
                 <SettingsSection title="3D map" description="Globe and terrain rendering are presentation features; they do not change world state.">
@@ -1720,18 +2069,26 @@ const SettingsWorkspace = ({
 
             {activeSection === "ai" && (
                 <>
-                <SettingsSection title="Provider" description="Choose which model service Open Historia uses. Provider-specific credentials stay with the selected provider.">
-                    <ApiProviderSelector provider={selectedProvider} onProviderChange={onApiProviderChange ?? (() => {})} />
-                </SettingsSection>
-                <ProviderConnectionPanel provider={selectedProvider} settings={providerSettings ?? {}} onSettingChange={onProviderSettingChange ?? (() => {})} />
+                <FallbackListSection />
+                <ConnectionsSection />
+                <ReasoningSection />
+                <RequestBudgetSection />
                 <SettingsSection title="Generation behavior" description="Bound model waiting behavior without changing the deterministic fallback path.">
                     <Toggle label="Limit AI generation" enabled={mapSettings.limitAiGeneration} onToggle={() => updateMapSetting("limitAiGeneration", MAP_SETTING_KEYS.limitAiGeneration, !mapSettings.limitAiGeneration)} />
                     <div style={settingsHelper}>
-                    On (default): the game stops waiting and falls back to canned events when the model goes quiet — 5 minutes of silence part-way through an answer, or 15 minutes with no answer at all. A model that is still writing is never interrupted, however long it takes. Off: waits forever, however stuck. Cancel works either way.
+                    Off (default): waits as long as the model needs, however stuck. On: the game stops waiting and falls back to canned events when the model goes quiet — 5 minutes of silence part-way through an answer, or 15 minutes with no answer at all. A model that is still writing is never interrupted, however long it takes. Cancel works either way.
                     </div>
                     <Toggle label="Generate long time skips in segments" enabled={mapSettings.chunkLongJumps} onToggle={() => updateMapSetting("chunkLongJumps", MAP_SETTING_KEYS.chunkLongJumps, !mapSettings.chunkLongJumps)} />
                     <div style={settingsHelper}>
-                    On (default): skips of more than a few months are generated in several shorter requests and merged into one round — slower, but far less likely to time out on a hosted provider. Off: the whole skip is generated in a single request.
+                    Off (default): the whole skip is generated in a single request. On: skips of more than a few months are generated in several shorter requests and merged into one round — slower and costlier in tokens, but far less likely to time out on a hosted provider.
+                    </div>
+                    <Toggle label="AI lookup functions" enabled={mapSettings.lookupFunctions} onToggle={() => updateMapSetting("lookupFunctions", MAP_SETTING_KEYS.lookupFunctions, !mapSettings.lookupFunctions)} />
+                    <div style={settingsHelper}>
+                    Only used while Save AI requests (above) is off, because every lookup is a whole extra request. On: before it answers, the model can call lookup functions — the exact power and region names, a region's neighbours, the war ledger, a chat — in up to three extra requests per task. Off: one request per task, with the region lists and ledgers written into the prompt instead. Needs a provider that supports function calling.
+                    </div>
+                    <Toggle label="Show time skip events as they are written" enabled={mapSettings.liveSkipEvents} onToggle={() => updateMapSetting("liveSkipEvents", MAP_SETTING_KEYS.liveSkipEvents, !mapSettings.liveSkipEvents)} />
+                    <div style={settingsHelper}>
+                    On (default): a skip opens the Events panel and fills it as the model writes, with the spinner and Cancel underneath. Reveal with Next event as they arrive, and the map and camera follow; wherever you get to is kept when the turn lands. Off: the skip stays behind the Timeline panel's spinner and the round appears at the end. The turn itself is the same either way, and Gemini arrives all at once regardless.
                     </div>
                     <Toggle label="Batch background AI tasks" enabled={mapSettings.batchBackgroundTasks} onToggle={() => updateMapSetting("batchBackgroundTasks", MAP_SETTING_KEYS.batchBackgroundTasks, !mapSettings.batchBackgroundTasks)} />
                     <div style={{ ...settingsHelper, marginBottom: 0 }}>
@@ -1743,14 +2100,20 @@ const SettingsWorkspace = ({
 
             {activeSection === "advanced" && (
                 <>
-                <SettingsSection title="Expert controls" description="Uncommon provider-level overrides live here so routine configuration stays readable.">
-                    <div style={{ color: "rgba(255,255,255,0.52)", fontSize: "0.7rem", lineHeight: 1.5 }}>
-                        These values are passed directly to the selected AI provider. They can alter request behavior in provider-specific ways and should normally be left empty.
-                    </div>
-                </SettingsSection>
-                <ProviderAdvancedPanel provider={selectedProvider} settings={providerSettings ?? {}} onSettingChange={onProviderSettingChange ?? (() => {})} onOpenAiSettings={() => onSectionChange("ai")} />
-                <SettingsSection title="Per-task models" description="Route individual AI tasks to a cheaper or a stronger model. Blank means the provider's default model. Saved per provider.">
-                    <TaskModelOverrides key={selectedProvider} provider={selectedProvider} suggestions={getRecentModels(selectedProvider)} />
+                <SettingsSection
+                title="Per-task models"
+                description="Route individual AI tasks to a cheaper or a stronger model from your list. A task tries its pick first, then the list from the top, so it only fails when every model is used up."
+                right={(
+                    <button
+                    type="button"
+                    onClick={() => onSectionChange("ai")}
+                    style={{ background: "rgba(59,130,246,0.12)", border: "1px solid rgba(96,165,250,0.24)", borderRadius: "8px", color: "#bfdbfe", cursor: "pointer", fontSize: "0.72rem", fontWeight: 750, padding: "0.45rem 0.65rem", whiteSpace: "nowrap" }}
+                    >
+                    AI settings
+                    </button>
+                )}
+                >
+                    <TaskPicks />
                 </SettingsSection>
                 <SettingsSection
                 title="Telemetry"
@@ -1771,44 +2134,8 @@ const SettingsWorkspace = ({
                     </div>
                     <Toggle label="Rate AI generations" enabled={ratingOn} onToggle={onToggleRating} />
                     <div style={{ ...settingsHelper, marginBottom: 0 }}>
-                    A small 1-10 bar after each time skip, Game Master edit and catalyst. Ratings sit beside the call in the console and its exports.
+                    A small 1-10 bar after each time skip, Game Master edit and interactive event. Ratings sit beside the call in the console and its exports.
                     </div>
-                </SettingsSection>
-                <SettingsSection title="Experimental" description="Work-in-progress systems. Stored with the save, so a copy of the campaign keeps the choice.">
-                    <ExperimentalPill />
-                    <Toggle label="Beta unit system" enabled={mapSettings.betaUnits} onToggle={() => updateBetaUnits(!mapSettings.betaUnits)} />
-                    <div style={{ ...settingsHelper, marginBottom: mapSettings.betaUnits !== isBetaUnits() ? "0.6rem" : 0 }}>
-                    On: the AI drives movement and combat, units hold a posture, and standing orders advance every turn. Expect bugs. Off (default): you move and attack your units yourself. Your save works with both, and switching back and forth loses nothing.
-                    </div>
-                    {/* The running session is pinned to what THIS SAVE said when it was opened
-                        (see isBetaUnits), so a flip only means something after the page is
-                        loaded again — the save already has the new value on disk by then.
-                        Shown only while the two actually disagree. Nothing needs quitting: the
-                        pin is module state in the page's own bundle, and every bit of campaign
-                        state lives on the server, so a reload is the whole of it. */}
-                    {mapSettings.betaUnits !== isBetaUnits() && (
-                        <div style={{ alignItems: "center", display: "flex", flexWrap: "wrap", gap: "0.5rem", fontSize: "0.72rem", color: "#ffd24a", lineHeight: 1.35 }}>
-                        <span>Takes effect when the game reloads.</span>
-                        <button
-                        type="button"
-                        onClick={() => window.location.reload()}
-                        title="Reloads the page. Your campaign is saved on the server, so nothing is lost — but finish any turn that is still generating first."
-                        style={{
-                            background: "rgba(255,210,74,0.14)",
-                            border: "1px solid rgba(255,210,74,0.5)",
-                            borderRadius: "6px",
-                            color: "#ffd24a",
-                            cursor: "pointer",
-                            fontFamily: "sans-serif",
-                            fontSize: "0.72rem",
-                            fontWeight: 700,
-                            padding: "0.2rem 0.55rem",
-                        }}
-                        >
-                        Reload now
-                        </button>
-                        </div>
-                    )}
                 </SettingsSection>
                 {!import.meta.env.VITE_OH_WEB && (
                     <SettingsSection title="Network" description="Other devices — the Android app, a browser on another computer — reach this server only while you say so.">
@@ -1919,10 +2246,6 @@ const SettingsMenu = ({
     onToggleFullscreen,
     onToggleGlobe,
     onToggleTerrain,
-    apiProvider,
-    onApiProviderChange,
-    providerSettings,
-    onProviderSettingChange,
     onOpenCheats,
     onOpenDebugConsole,
     onOpenEvents,
@@ -1937,7 +2260,6 @@ const SettingsMenu = ({
     // the player to "ai"); null opens the quick menu.
     initialSection = null,
 }) => {
-    const selectedProvider = apiProvider ?? DEFAULT_PROVIDER;
     const isMobile = useIsMobile();
     const [activeSettingsSection, setActiveSettingsSection] = useState(initialSection || null);
     const [activeQuickTab, setActiveQuickTab] = useState(initialSection ? "settings" : "tools");
@@ -1971,14 +2293,14 @@ const SettingsMenu = ({
         disableEventCamera: getMapSetting(MAP_SETTING_KEYS.disableEventCamera),
         // Not getMapSetting: this one ships ON, and an absent key must read as
         // on rather than off (see mapSettings.js).
-        limitAiGeneration: getMapSettingDefaultOn(MAP_SETTING_KEYS.limitAiGeneration),
+        limitAiGeneration: getMapSetting(MAP_SETTING_KEYS.limitAiGeneration),
         // Same again: ships ON.
-        chunkLongJumps: getMapSettingDefaultOn(MAP_SETTING_KEYS.chunkLongJumps),
+        chunkLongJumps: getMapSetting(MAP_SETTING_KEYS.chunkLongJumps),
+        // Ships ON: an absent key reads as on (see mapSettings.js).
+        lookupFunctions: getMapSettingDefaultOn(MAP_SETTING_KEYS.lookupFunctions),
+        // Ships ON too.
+        liveSkipEvents: getMapSettingDefaultOn(MAP_SETTING_KEYS.liveSkipEvents),
         batchBackgroundTasks: getMapSetting(MAP_SETTING_KEYS.batchBackgroundTasks),
-        // Not getMapSetting: this one belongs to the save, not the browser
-        // profile (see mapSettings.js). resolveBetaUnits falls back to the
-        // localStorage key for a save that has never chosen.
-        betaUnits: resolveBetaUnits(),
     }));
 
     const updateMapSetting = (stateKey, settingKey, value) => {
@@ -1986,27 +2308,25 @@ const SettingsMenu = ({
         setMapSettingsState((current) => ({ ...current, [stateKey]: value }));
     };
     const updateBasemapStyle = (value) => setMapSettingValue(MAP_SETTING_KEYS.basemapStyle, value);
+    const labelFont = useMapSettingValue(MAP_SETTING_KEYS.labelFont);
+    // The field shows the keystrokes; the setting stores them trimmed. Storing
+    // on every keystroke through setMapSettingValue's trim and echoing the
+    // stored value back used to eat a space the moment it was typed, so "Times
+    // New Roman" could not be typed at all. The draft is shown while it is the
+    // stored value plus whitespace; a change made elsewhere wins over it.
+    const [labelFontDraft, setLabelFontDraft] = useState(labelFont);
+    const labelFontShown = labelFontDraft.trim() === labelFont ? labelFontDraft : labelFont;
+    const updateLabelFont = (value) => {
+        setLabelFontDraft(value);
+        setMapSettingValue(MAP_SETTING_KEYS.labelFont, value);
+    };
 
     // Telemetry switches (telemetry.js): their own keys, both on by default.
     const [telemetryOn, setTelemetryOn] = useState(() => isTelemetryEnabled());
     const [ratingOn, setRatingOn] = useState(() => isRatingEnabled());
-    const toggleTelemetry = () => { const next = !telemetryOn; setTelemetryOn(next); setTelemetryEnabled(next); };
-    const toggleRating = () => { const next = !ratingOn; setRatingOn(next); setRatingEnabled(next); };
-
-    // The save's own value arrives asynchronously (library.js reads game.json),
-    // and it changes again whenever a different save is activated — both of them
-    // after this panel's state was seeded. Without this the checkbox keeps
-    // showing the app-wide default, which for a beta save is the wrong box.
-    useEffect(() => {
-        const onUpdated = () =>
-            setMapSettingsState((current) => {
-                const next = resolveBetaUnits();
-                return current.betaUnits === next ? current : { ...current, betaUnits: next };
-            });
-        onUpdated();
-        window.addEventListener("mapSettings:updated", onUpdated);
-        return () => window.removeEventListener("mapSettings:updated", onUpdated);
-    }, []);
+    // Logged here rather than in telemetry.js, which imports nothing on purpose.
+    const toggleTelemetry = () => { const next = !telemetryOn; setTelemetryOn(next); setTelemetryEnabled(next); logSettingChange("Record AI telemetry", next); };
+    const toggleRating = () => { const next = !ratingOn; setRatingOn(next); setRatingEnabled(next); logSettingChange("Rate AI generations", next); };
 
     // Escape closes the quick menu; the workspace handles its own (it goes back
     // to the quick menu first).
@@ -2018,30 +2338,6 @@ const SettingsMenu = ({
         window.addEventListener("keydown", onKeyDown);
         return () => window.removeEventListener("keydown", onKeyDown);
     }, [activeSettingsSection, onClose]);
-
-    // The unit system is stored in the active save's game.json so it survives a
-    // restart and travels with a copied or duplicated save. The localStorage write
-    // still happens (through updateMapSetting): it is no longer where the setting
-    // lives, only the default handed to the next save that has never chosen one.
-    //
-    // Order matters — applySaveBetaUnits first, because writeGameData re-stamps
-    // the flag from it rather than from the object it is handed, which is what
-    // makes this safe to do while a turn is generating.
-    const updateBetaUnits = (value) => {
-        updateMapSetting("betaUnits", MAP_SETTING_KEYS.betaUnits, value);
-        const gameId = getLibraryState().activeGameId;
-        // With no save open there is nothing to store it on, and writing game.json
-        // anyway would have the server CREATE a session from the selected scenario
-        // — a settings click must not start a campaign. The localStorage default
-        // above is enough: the save the player opens next inherits it.
-        if (!gameId) return;
-        applySaveBetaUnits(gameId, value);
-        readGameData({ force: true })
-            .then((game) => writeGameData(game))
-            .catch((error) => {
-                console.warn("Failed to store the unit system on this save:", error);
-            });
-    };
 
     const runAndClose = (action) => {
         action?.();
@@ -2079,15 +2375,12 @@ const SettingsMenu = ({
             onToggleFullscreen={onToggleFullscreen}
             onToggleGlobe={onToggleGlobe}
             onToggleTerrain={onToggleTerrain}
-            selectedProvider={selectedProvider}
-            onApiProviderChange={onApiProviderChange}
-            providerSettings={providerSettings}
-            onProviderSettingChange={onProviderSettingChange}
             mapSettings={mapSettings}
             updateMapSetting={updateMapSetting}
             basemapStyle={basemapStyle}
             updateBasemapStyle={updateBasemapStyle}
-            updateBetaUnits={updateBetaUnits}
+            labelFont={labelFontShown}
+            updateLabelFont={updateLabelFont}
             telemetryOn={telemetryOn}
             onToggleTelemetry={toggleTelemetry}
             ratingOn={ratingOn}
@@ -2114,8 +2407,8 @@ const SettingsMenu = ({
                 <div style={grid}>
                     <QuickAction title="General" description="Language, display and accessibility" symbol="◫" tone="blue" onClick={() => openSettingsSection("general")} />
                     <QuickAction title="Map" description="Basemap, labels, globe and camera" symbol="◇" tone="blue" onClick={() => openSettingsSection("map")} />
-                    <QuickAction title="AI" description="Provider, model, reasoning and limits" symbol="✦" onClick={() => openSettingsSection("ai")} />
-                    <QuickAction title="Advanced" description="Provider parameters and expert controls" symbol="⌘" onClick={() => openSettingsSection("advanced")} />
+                    <QuickAction title="AI" description="Models, backups, keys and reasoning" symbol="✦" onClick={() => openSettingsSection("ai")} />
+                    <QuickAction title="Advanced" description="Per-task models and expert controls" symbol="⌘" onClick={() => openSettingsSection("advanced")} />
                 </div>
             </QuickMenuPanel>
         );

@@ -1,4 +1,4 @@
-/*! Open Historia — canonical war ledger tests © 2026 Nicholas Krol, MIT (see src/Editor/LICENSE). */
+/*! Open Historia — canonical war ledger tests © 2026 Nicholas Krol, AGPL-3.0-or-later (see LICENSE). */
 // Run: node --test src/Game/AI/warLedger.test.js
 
 import test from "node:test";
@@ -8,7 +8,9 @@ import {
   applyWarUpdates,
   buildCanonicalWarContext,
   decodeWarUpdates,
+  eventNarratesHardCombat,
   reconcileCombatWarState,
+  repairWarLedgerPayload,
   validateWarLedgerPayload,
 } from "./nativeWarLedger.js";
 
@@ -112,6 +114,48 @@ test("a readiness event naming two allies is not combat and creates no war", () 
   assert.equal(validateWarLedgerPayload(candidate, { world }), "");
 });
 
+// Transcribed from a player's debug report (Iran, round 55): the event the model
+// wrote for the player's own queued action. It was read as a launched military
+// offensive with no combatants, so the retry was spent on a phantom battle and
+// the final attempt dropped the event from the turn.
+test("a diplomatic offensive is not a battle; a military offensive still is", () => {
+  const diplomatic = {
+    id: "segment-1-event-2",
+    date: "2026-07-18",
+    kind: "diplomacy",
+    title: "Ministry of Foreign Affairs Launches European Diplomatic Offensive for Sanctions Relief",
+    description: "The Ministry of Foreign Affairs, in close coordination with Omani backchannel delegates, launches an active diplomatic offensive across European capitals, formally demanding the immediate lifting of unilateral Western sanctions against the sovereign Bahraini Republic and the unified government of Yemen.",
+  };
+  assert.equal(eventNarratesHardCombat(diplomatic), false);
+  const candidate = { events: [diplomatic], warUpdates: "" };
+  assert.deepEqual(reconcileCombatWarState(candidate, { world }).unresolved, []);
+  assert.equal(validateWarLedgerPayload(candidate, { world }), "");
+
+  for (const phrase of ["charm offensive", "media counter-offensive", "peace offensive"]) {
+    assert.equal(
+      eventNarratesHardCombat({ kind: "diplomacy", title: `Tokyo launches a ${phrase} in Seoul`, description: "" }),
+      false,
+      phrase,
+    );
+  }
+
+  assert.equal(eventNarratesHardCombat({
+    kind: "military",
+    title: "Germany launches an offensive on the Marne",
+    description: "German armies open a counter-offensive against French positions.",
+  }), true, "a military offensive is still combat");
+  assert.equal(eventNarratesHardCombat({
+    kind: "diplomacy",
+    title: "Paris opens a diplomatic offensive as armies clash on the border",
+    description: "",
+  }), true, "real fighting in the same event is still combat");
+  assert.equal(eventNarratesHardCombat({
+    kind: "military",
+    title: "Moscow launches a cyber offensive against Kyiv's grid",
+    description: "",
+  }), true, "a cyber offensive is a hostile act, not a figure of speech");
+});
+
 test("ceasefire, resume and end move the status; a second start on a live war is refused", () => {
   const warWorld = { ...world, wars: [{ id: "w", status: "active", sideA: ["A"], sideB: ["B"], startedDate: "1900-01-01" }] };
   const events = [{ id: "e1", date: "1901-01-01", title: "Armistice signed between A and B", description: "The guns fall silent.", warId: "w" }];
@@ -130,4 +174,44 @@ test("ceasefire, resume and end move the status; a second start on a live war is
   assert.equal(ended.wars[0].status, "ended");
   assert.equal(ended.wars[0].endedDate, "1901-01-01");
   assert.match(buildCanonicalWarContext(ended.world), /No active or ceasefire canonical wars/);
+});
+
+// A live run (2026-09-17) lost two real events to this: "Tragic Clashes and Fire
+// in Odessa" and "Explosion Rocks Regional Administration Building in Luhansk"
+// read as hard combat to the detector, named no two belligerents, and were
+// DELETED by the salvage path — and under salvage-first there is no second
+// attempt to correct them, so the player simply never saw them. What must fail
+// closed is the belligerency, not the event.
+test("an unbindable combat event is reported for unbinding, never for deletion", () => {
+  const riot = {
+    id: "e1",
+    date: "2014-05-02",
+    title: "Tragic Clashes and Fire in Odessa",
+    description: "Street clashes between rival demonstrators end with a building alight; dozens are killed.",
+    kind: "world",
+    combatants: [],
+  };
+  const candidate = { events: [riot], warUpdates: "" };
+  const outcome = reconcileCombatWarState(candidate, { world });
+
+  assert.equal(outcome.unresolved.length, 1, "the engine cannot tie it to a war, and says so");
+  assert.equal(outcome.unresolved[0].index, 0);
+  // reconcileCombatWarState itself never removes an event: it reports, and the
+  // caller (gameplay.js validateGeneratedWorldChanges) unbinds rather than drops.
+  assert.equal(candidate.events.length, 1, "the event is still there after reconciliation");
+  assert.equal(candidate.events[0].title, "Tragic Clashes and Fire in Odessa");
+
+  // What the caller then does (gameplay.js validateGeneratedWorldChanges): strip
+  // the war metadata and keep the event. The ledger still complains that prose
+  // reading as combat carries no warId — a riot IS written like a battle — and
+  // that complaint is only ever logged: repairWarLedgerPayload, the last stage,
+  // strips bindings and drops records but NEVER removes an event. So the event
+  // reaches the player either way, with no belligerency invented for it.
+  candidate.events = candidate.events.map((event) => ({ ...event, warId: "", combatants: [] }));
+  const repair = repairWarLedgerPayload(candidate, { world });
+  assert.equal(candidate.events.length, 1, "the repair keeps the event");
+  assert.equal(candidate.events[0].warId, "", "and invents no war for it");
+  assert.deepEqual(candidate.events[0].combatants, []);
+  assert.deepEqual(decodeWarUpdates(candidate.warUpdates), [], "no war record was conjured either");
+  assert.match(repair.residual, /no event.warId/, "the residual complaint is about the ledger, and is only logged");
 });

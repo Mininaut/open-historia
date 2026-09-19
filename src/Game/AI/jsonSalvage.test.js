@@ -1,4 +1,4 @@
-/*! Open Historia — model-output JSON salvage tests © 2026 Nicholas Krol, MIT (see src/Editor/LICENSE). */
+/*! Open Historia — model-output JSON salvage tests © 2026 Nicholas Krol, AGPL-3.0-or-later (see LICENSE). */
 // Run: node --test src/Game/AI/jsonSalvage.test.js
 //
 // Runs without node_modules: jsonSalvage.js is import-free.
@@ -38,7 +38,7 @@ test("a mimicked tool call missing its outer bracket still yields the arguments"
 "stopDate":"2032-11-02",
 "summary":"A wave of programme initiations.",
 "clearActions":true,
-"catalyst":null,
+"interactive":null,
 "diplomaticOutreach":[]
 }
 }
@@ -146,4 +146,40 @@ ${ANSWER_SENTINEL}
 
 test("the directive actually names the marker it asks for", () => {
   assert.ok(ANSWER_SENTINEL_DIRECTIVE.includes(ANSWER_SENTINEL));
+});
+
+// A DeepSeek V4 Flash field report: copying the board prompt's `Operation "Name"`
+// title into its answer left one unescaped pair of quotes, and the whole reply
+// stopped being JSON — which held the turn. Verbatim from the log.
+test("a quote copied into a string without its backslash no longer sinks the reply", () => {
+  const raw = '{"projectOps":[{"op":"update","projectId":"project-0-mtuaa589-l1rt3ud","name":"Operation "Саммит Нормандской четвёрки"","eventIndex":0,"progress":18,"lastUpdate":"Инициатива начала реализацию."}]}';
+  const parsed = extractJsonPayload(raw);
+  assert.equal(parsed?.projectOps?.[0]?.name, 'Operation "Саммит Нормандской четвёрки"');
+  assert.equal(parsed.projectOps[0].projectId, "project-0-mtuaa589-l1rt3ud");
+  assert.equal(parsed.projectOps[0].progress, 18);
+});
+
+test("a quote mid-string is content; only a quote before a separator closes the string", () => {
+  assert.deepEqual(
+    extractJsonPayload('{"note":"he called it "the plan" in public","ok":true}'),
+    { note: 'he called it "the plan" in public', ok: true },
+  );
+});
+
+test("quotes that were escaped properly are left exactly as they were", () => {
+  assert.deepEqual(extractJsonPayload('{"note":"a \\"b\\" c"}'), { note: 'a "b" c' });
+});
+
+test("extractJsonArray: strict first, then the repairs, then the first balanced array in the text", async () => {
+  const { extractJsonArray } = await import("./jsonSalvage.js");
+  assert.deepEqual(extractJsonArray("[]"), []);
+  assert.deepEqual(extractJsonArray('[{"a":1}]'), [{ a: 1 }]);
+  assert.deepEqual(extractJsonArray('[{"a":1},]'), [{ a: 1 }], "a trailing comma is repaired");
+  assert.deepEqual(extractJsonArray("[{“a”:“b”}]"), [{ a: "b" }], "smart quotes are repaired");
+  assert.deepEqual(extractJsonArray('[{"a":1}] // nothing else moved'), [{ a: 1 }], "a remark after the array is ignored");
+  assert.deepEqual(extractJsonArray('Here you go: [{"a":1}] and [{"b":2}]'), [{ a: 1 }], "the first array wins");
+  assert.deepEqual(extractJsonArray('{"wrapper":true} [{"a":1}]'), [{ a: 1 }], "an object before the array is skipped");
+  assert.equal(extractJsonArray('{"a":1}'), null, "an object alone is not an array");
+  assert.equal(extractJsonArray("no json here"), null);
+  assert.equal(extractJsonArray(""), null);
 });

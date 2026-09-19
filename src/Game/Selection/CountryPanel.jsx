@@ -1,4 +1,4 @@
-/*! Open Historia — country info panel © 2026 Nicholas Krol, MIT (see src/Editor/LICENSE). */
+/*! Open Historia — country info panel © 2026 Nicholas Krol, AGPL-3.0-or-later (see LICENSE). */
 import React, { useEffect, useMemo, useState } from "react";
 import { createPortal } from "react-dom";
 import ReactMarkdown from "react-markdown";
@@ -9,7 +9,7 @@ import { requestDiplomaticChat } from "../GameUI/chat.jsx";
 import GameFlagPicker from "../GameUI/GameFlagPicker.jsx";
 import { resolvePolityFlag } from "../../runtime/polityFlags.js";
 import { resolvePolityIdentity } from "../../runtime/polityIdentity.js";
-import { generateCountryStats } from "../AI/gameplay.js";
+import { generateCountryStats } from "../AI/gameplayLazy.js";
 
 // Bridge: the region popup's info button opens this panel from outside React.
 let _openPanel = null;
@@ -66,7 +66,9 @@ const eventInvolvesCountry = (event, code, name) => {
     if ((impacts.regionTransfers ?? []).some((transfer) => transfer?.toCode === code || transfer?.fromCode === code)) return true;
     if ((impacts.regionControlOps ?? []).some((op) =>
         [op?.fromCode, op?.toCode, op?.actorCode, op?.claimantCode].some((value) => value === code || value === name))) return true;
-    if ((impacts.createdChats ?? []).some((chat) => (chat?.countries ?? []).some((country) => country?.code === code || country?.name === name))) return true;
+    if ((impacts.createdChats ?? []).some((chat) => (chat?.countries ?? []).some((country) => (typeof country === "string"
+        ? country === code || country === name
+        : country?.code === code || country?.name === name)))) return true;
     const haystack = `${event?.title ?? ""} ${event?.description ?? ""}`.toLowerCase();
     return Boolean(name) && haystack.includes(String(name).toLowerCase());
 };

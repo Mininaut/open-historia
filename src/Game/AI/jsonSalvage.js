@@ -1,4 +1,4 @@
-/*! Open Historia — model-output JSON salvage © 2026 Nicholas Krol, MIT (see src/Editor/LICENSE). */
+/*! Open Historia — model-output JSON salvage © 2026 Nicholas Krol, AGPL-3.0-or-later (see LICENSE). */
 // Turning whatever a model actually said back into the payload the schema
 // wants. Kept import-free (and separate from gameplay.js, which pulls in the
 // whole browser runtime) so the salvage rules can be unit-tested directly —
@@ -24,7 +24,46 @@ const lenientJsonParse = (value) => {
   const repaired = value
     .replace(/[“”]/g, '"')
     .replace(/,\s*([}\]])/g, "$1");
-  return maybeJsonParse(repaired);
+  return maybeJsonParse(repaired) ?? maybeJsonParse(escapeInnerQuotes(repaired));
+};
+
+// A quote copied into a string without its backslash. The board prompt titles
+// entries `Operation "Name"`, and a model copying that into its answer wrote
+// `"name":"Operation "Name""` — one unescaped pair, and the whole reply stopped
+// being JSON, which held the turn (a DeepSeek V4 Flash field report).
+//
+// Inside a string, a quote can only END it if what follows is a separator (`,`
+// `:` `}` `]`) or the end of the text; any other quote is content and gets its
+// backslash. Only reached after a strict parse AND the other repairs failed, so
+// well-formed output is never touched, and whatever this produces still has to
+// pass the schema.
+const escapeInnerQuotes = (text) => {
+  let out = "";
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i];
+    if (!inString) {
+      if (ch === '"') inString = true;
+      out += ch;
+      continue;
+    }
+    if (escaped) {
+      escaped = false;
+    } else if (ch === "\\") {
+      escaped = true;
+    } else if (ch === '"') {
+      const next = text.slice(i + 1).match(/^\s*(.?)/)[1];
+      if (next === "" || ",:}]".includes(next)) {
+        inString = false;
+      } else {
+        out += "\\\"";
+        continue;
+      }
+    }
+    out += ch;
+  }
+  return out;
 };
 
 const closersFor = (stack) => stack
@@ -182,6 +221,29 @@ export const stripBeforeSentinel = (text) => {
   const body = String(text ?? "");
   const at = body.lastIndexOf(ANSWER_SENTINEL);
   return at === -1 ? body : body.slice(at + ANSWER_SENTINEL.length);
+};
+
+// One JSON ARRAY out of a text that should be one. Strict first; then the
+// same repairs extractJsonPayload makes (smart quotes, trailing commas, an
+// unescaped inner quote); then the first balanced [...] block in the text that
+// parses, so a comment or a second array after the real one no longer costs
+// the whole transaction. Null when nothing array-shaped survives — the caller
+// decides whether that is an error.
+export const extractJsonArray = (rawText) => {
+  const text = normalizeString(rawText);
+  if (!text) return null;
+  const direct = lenientJsonParse(text);
+  if (Array.isArray(direct)) return direct;
+  for (const fence of text.matchAll(/```[a-z]*\s*([\s\S]*?)```/gi)) {
+    const parsed = fence[1] ? lenientJsonParse(fence[1].trim()) : null;
+    if (Array.isArray(parsed)) return parsed;
+  }
+  for (const candidate of balancedJsonCandidates(text)) {
+    if (candidate[0] !== "[") continue;
+    const parsed = lenientJsonParse(candidate);
+    if (Array.isArray(parsed)) return parsed;
+  }
+  return null;
 };
 
 export const extractJsonPayload = (rawText) => {

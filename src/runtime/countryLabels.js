@@ -1,4 +1,4 @@
-/*! Open Historia — portions (custom-region owner labels) © 2026 Nicholas Krol, MIT (see src/Editor/LICENSE). */
+/*! Open Historia — portions (custom-region owner labels) © 2026 Nicholas Krol, AGPL-3.0-or-later (see LICENSE). */
 import {
   PMTILES_ARCHIVES,
   decodeVectorTile,
@@ -1817,7 +1817,7 @@ const buildLandmassLabelRecords = ({
       },
     },
     // Guaranteed overview renderer. For line-capable polities Nations.jsx shows
-    // this only below curveMinZoom; point-only polities keep it through z7.1.
+    // this only below curveMinZoom; point-only polities keep it through z7.5 (LABEL_MAX_ZOOM).
     point: {
       type: "Feature",
       id: `${featureId}-point`,
@@ -2186,11 +2186,12 @@ export const loadCountryLabelCollections = async ({ force = false, ownedCodes = 
   return request;
 };
 
+// No size: it meant serialising both FeatureCollections for a startup label.
+// normalizeTaskResult already treats a missing size as 0.
 export const warmCountryLabelCollections = async (options = {}) => {
-  const collections = await loadCountryLabelCollections(options);
+  await loadCountryLabelCollections(options);
   return {
     kind: "json",
-    size: JSON.stringify(collections).length,
     url: countryLabelsValueKey || COUNTRY_LABELS_CACHE_KEY,
   };
 };

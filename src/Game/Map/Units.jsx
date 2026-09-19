@@ -1,4 +1,4 @@
-/*! Open Historia — troop/unit map layer © 2026 Nicholas Krol, MIT (see src/Editor/LICENSE). */
+/*! Open Historia — troop/unit map layer © 2026 Nicholas Krol, AGPL-3.0-or-later (see LICENSE). */
 // Units are the map's way of showing what the events say, so they have to read
 // as forces in motion rather than counters that blink from place to place.
 //
@@ -18,7 +18,6 @@ import { Layer, Source, useMap } from "react-map-gl/maplibre";
 import { getNationColors, getNationFlags } from "../../runtime/assets.js";
 import { subscribeUnits, getUnits, getPendingUnitOrders, startUnitsSync } from "./unitsController.js";
 import { resolveUnitFlagUrl, syncUnitFlagIcons } from "./unitFlagIcons.js";
-import { isBetaUnits } from "../../runtime/mapSettings.js";
 import { useWorldState } from "./useWorldState.js";
 
 const EMPTY_FEATURE_COLLECTION = { type: "FeatureCollection", features: [] };
@@ -176,9 +175,6 @@ const Units = () => {
     return () => mapInstance.off?.("styledata", check);
   }, [map]);
   const labelBeforeId = labelsReady ? "country-curved-labels" : undefined;
-  // Pinned for the session (see runtime/mapSettings.js). Counters, flags and
-  // names are the same in both systems — only the standing-order overlay differs.
-  const betaUnits = isBetaUnits();
   // Scenario polities carry their own flags, and a custom-era country usually
   // resolves to no ISO flag at all — so this is the only flag it will ever have.
   const { polityOverrides } = useWorldState();
@@ -204,27 +200,61 @@ const Units = () => {
   const polityFlagSignatureRef = useRef("");
 
   useEffect(() => {
-    getNationColors()
-      .then((next) => {
-        colorRef.current = next;
-        setColorMap(next);
-      })
-      .catch((error) => console.error("Failed to load colors for units:", error));
-  }, []);
-
-  // Author-set flags (the scenario's flags.json). Fetched once, then a resync so
-  // counters already on screen pick them up rather than waiting out the 5s poll.
-  useEffect(() => {
     let cancelled = false;
-    getNationFlags()
-      .then((flags) => {
-        if (cancelled) return;
-        flagSourcesRef.current = { ...flagSourcesRef.current, customFlags: flags || {} };
-        flagRefreshRef.current();
-      })
-      .catch((error) => console.error("Failed to load flags for units:", error));
+    let colorGeneration = 0;
+    const refreshColors = () => {
+      const generation = ++colorGeneration;
+      getNationColors()
+        .then((next) => {
+          if (cancelled || generation !== colorGeneration) return;
+          colorRef.current = next;
+          setColorMap(next);
+          if (!rafRef.current) flagRefreshRef.current();
+        })
+        .catch((error) => console.error("Failed to load colors for units:", error));
+    };
+
+    refreshColors();
+    // assets.js invalidates the palette promise before emitting colors-updated;
+    // active-game changes move JSON_URLS.colors to a new token/key.
+    const onColorsUpdated = () => refreshColors();
+    const onActiveGameChanged = () => refreshColors();
+    window.addEventListener("oh:colors-updated", onColorsUpdated);
+    window.addEventListener("oh:active-game-changed", onActiveGameChanged);
     return () => {
       cancelled = true;
+      window.removeEventListener("oh:colors-updated", onColorsUpdated);
+      window.removeEventListener("oh:active-game-changed", onActiveGameChanged);
+    };
+  }, []);
+
+  // Author-set flags live in scenario/game flags.json. Runtime flag writes emit
+  // oh:flags-updated; scenario/game switches emit oh:active-game-changed. Listen
+  // to both so a regime flag replacement reaches counters immediately instead of
+  // waiting for a remount, and force-bypass the scenario-token memo after writes.
+  useEffect(() => {
+    let cancelled = false;
+    let flagGeneration = 0;
+    const refreshFlags = ({ force = false } = {}) => {
+      const generation = ++flagGeneration;
+      getNationFlags({ force })
+        .then((flags) => {
+          if (cancelled || generation !== flagGeneration) return;
+          flagSourcesRef.current = { ...flagSourcesRef.current, customFlags: flags || {} };
+          flagRefreshRef.current();
+        })
+        .catch((error) => console.error("Failed to load flags for units:", error));
+    };
+
+    refreshFlags();
+    const onFlagsUpdated = () => refreshFlags({ force: true });
+    const onActiveGameChanged = () => refreshFlags({ force: true });
+    window.addEventListener("oh:flags-updated", onFlagsUpdated);
+    window.addEventListener("oh:active-game-changed", onActiveGameChanged);
+    return () => {
+      cancelled = true;
+      window.removeEventListener("oh:flags-updated", onFlagsUpdated);
+      window.removeEventListener("oh:active-game-changed", onActiveGameChanged);
     };
   }, []);
 
@@ -409,14 +439,7 @@ const Units = () => {
 
   // Heading lines and station rings. Rebuilt only when the standing orders
   // change — they are static between turns, unlike the counters themselves.
-  //
-  // Beta only: they draw standing orders, and the classic system has no engine
-  // advancing any. A save carried over from beta play still HOLDS its orders (they
-  // are preserved on disk so switching back is lossless), so this has to gate on
-  // the system rather than on the list being empty — otherwise classic would paint
-  // heading lines toward destinations nothing is moving to.
   const orderData = useMemo(() => {
-    if (!betaUnits) return EMPTY_FEATURE_COLLECTION;
     const units = new Map(unitsRef.current.map((unit) => [unit.id, unit]));
     const features = [];
     for (const order of orders) {
@@ -442,7 +465,7 @@ const Units = () => {
       });
     }
     return features.length ? { type: "FeatureCollection", features } : EMPTY_FEATURE_COLLECTION;
-  }, [orders, colorMap, betaUnits]);
+  }, [orders, colorMap]);
 
   return (
     <>

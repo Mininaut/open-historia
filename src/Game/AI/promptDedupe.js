@@ -1,4 +1,4 @@
-/*! Open Historia — call-time directive de-duplication © 2026 Nicholas Krol, MIT (see src/Editor/LICENSE). */
+/*! Open Historia — call-time directive de-duplication © 2026 Nicholas Krol, AGPL-3.0-or-later (see LICENSE). */
 // Deciding whether a call-time directive still needs to be appended, or whether
 // the rendered prompt already says it.
 //
@@ -91,3 +91,24 @@ export const collapseRepeatedBlock = (prompt, block, pointer) => {
     const tail = text.slice(first + needle.length).split(needle).join(String(pointer ?? ""));
     return head + tail;
 };
+
+// The scenario's simulation rules take the same two routes: the task text
+// renders ${HISTORICAL_PRESET_SIMULATION_RULES}, and buildWorldSummary embeds
+// them on its "Simulation rules:" line. Eleven prompts render both, the advisor
+// and the diplomatic chat among them. Two tasks (actions, idleDiplomacy) reach
+// the rules ONLY through the world summary, so the same reasoning as the
+// briefing applies: collapse after assembly, never strip them from the summary.
+
+export const BRIEFING_POINTER = "(The pre-round-one briefing is reproduced in full earlier in this prompt.)";
+export const SIMULATION_RULES_POINTER = "(The scenario's simulation rules are reproduced in full earlier in this prompt.)";
+
+/**
+ * Collapse every repeat of the briefing and the simulation rules in an
+ * assembled prompt. `variables` is the prompt's template variables; a missing
+ * or short value leaves the prompt as it was.
+ */
+export const collapseRepeatedWorldContext = (prompt, variables) => collapseRepeatedBlock(
+    collapseRepeatedBlock(prompt, variables?.worldBeforeRoundOne, BRIEFING_POINTER),
+    variables?.simulationRules,
+    SIMULATION_RULES_POINTER,
+);

@@ -18,21 +18,26 @@ const DB_VERSION = 1;
 const STORE = "generations";
 const MAX_PERSISTED_RECORDS = 200;
 const MAX_SESSION_RECORDS = 500;
-const MAX_RAW_RESPONSE_CHARS = 60000;
-const MAX_RAW_PROMPT_CHARS = 80000;
-const MAX_USER_MESSAGE_CHARS = 20000;
+// Prompts, user messages and answers are kept WHOLE. They used to be clipped
+// (80k / 20k / 60k characters), which cut the system prompt of any real turn
+// short in the console — a jump's prompt is well past 80k — and read as the
+// game sending a truncated prompt. It never did: the provider always got the
+// full text; only this record was cut. Storage is bounded by record COUNT
+// (MAX_SESSION_RECORDS / MAX_PERSISTED_RECORDS), never by trimming their text.
 
-// Settings (localStorage, same pattern as mapSettings/providerConfig). Both
-// default ON: only an explicit "0" turns them off.
+// Settings (localStorage, same pattern as mapSettings/providerConfig).
+// Recording ships ON: only an explicit "0" turns it off. Rating ships OFF: the
+// 1-10 bar after every skip is opt-in, so only an explicit "1" turns it on.
 const TELEMETRY_SETTING_KEY = "ai_debug_telemetry";
 const RATING_SETTING_KEY = "ai_rate_generations";
 export const TELEMETRY_SETTINGS_EVENT = "oh:telemetry-settings";
 
-const readFlag = (key) => {
+const readFlag = (key, { defaultOn = true } = {}) => {
   try {
-    return localStorage.getItem(key) !== "0";
+    const stored = localStorage.getItem(key);
+    return defaultOn ? stored !== "0" : stored === "1";
   } catch {
-    return true;
+    return defaultOn;
   }
 };
 
@@ -47,7 +52,7 @@ const writeFlag = (key, enabled) => {
 
 export const isTelemetryEnabled = () => readFlag(TELEMETRY_SETTING_KEY);
 export const setTelemetryEnabled = (enabled) => writeFlag(TELEMETRY_SETTING_KEY, enabled);
-export const isRatingEnabled = () => readFlag(RATING_SETTING_KEY);
+export const isRatingEnabled = () => readFlag(RATING_SETTING_KEY, { defaultOn: false });
 export const setRatingEnabled = (enabled) => writeFlag(RATING_SETTING_KEY, enabled);
 
 // Tasks whose completion is worth an immediate "rate this" prompt — the
@@ -57,8 +62,8 @@ export const RATING_ELIGIBLE_TASKS = Object.freeze(new Set([
   "jumpForward",
   "autoJumpForward",
   "gameMaster",
-  "catalystExecutor",
-  "catalystSummary",
+  "interactiveExecutor",
+  "interactiveSummary",
 ]));
 
 export const GENERATION_COMPLETE_EVENT = "oh:ai-generation-complete";
@@ -153,8 +158,8 @@ export const startAiRecord = (meta = {}) => {
     // what was asked
     systemPromptChars: systemPrompt.length,
     userMessageChars: userMessage.length,
-    systemPrompt: clip(systemPrompt, MAX_RAW_PROMPT_CHARS),
-    userMessage: clip(userMessage, MAX_USER_MESSAGE_CHARS),
+    systemPrompt,
+    userMessage,
     // what came back
     responseChars: 0,
     rawResponse: "",
@@ -163,6 +168,9 @@ export const startAiRecord = (meta = {}) => {
     error: "",
     validationError: "",
     parsedSummary: null,
+    // what the model asked for on the way (lookupTools.js): every function call
+    // it made and what it was told, round by round — see attachLookupRound
+    lookups: null,
     // human feedback
     rating: null,
     ratedAt: null,
@@ -186,6 +194,38 @@ export const attachCallMetrics = (record, { model, usage, firstByteMs } = {}) =>
   if (Number.isFinite(firstByteMs)) record.firstByteMs = firstByteMs;
 };
 
+// One lookup round: the calls the model made in one turn and what each was
+// answered. Kept whole, like the prompt — a dropped transfer is diagnosed from
+// exactly these answers ("it asked for Russia and was told there is none").
+// `calls` is [{ name, args, label?, response, ms?, error? }]; `usage` is the
+// request that produced the calls, so the rounds add up to the record's usage.
+export const attachLookupRound = (record, { round, calls = [], elapsedMs = null, usage = null } = {}) => {
+  if (!record) return;
+  const ledger = record.lookups && typeof record.lookups === "object"
+    ? record.lookups
+    : { rounds: 0, calls: 0, chars: 0, entries: [], roundUsage: [] };
+  const roundNumber = Number.isInteger(round) ? round : ledger.rounds + 1;
+  ledger.rounds += 1;
+  for (const call of Array.isArray(calls) ? calls : []) {
+    const response = typeof call?.response === "string" ? call.response : JSON.stringify(call?.response ?? null);
+    const entry = {
+      round: roundNumber,
+      name: String(call?.name ?? ""),
+      args: call?.args && typeof call.args === "object" ? call.args : {},
+      label: String(call?.label ?? call?.name ?? ""),
+      response,
+      responseChars: response.length,
+      ms: Number.isFinite(call?.ms) ? call.ms : null,
+      error: Boolean(call?.error),
+    };
+    ledger.entries.push(entry);
+    ledger.calls += 1;
+    ledger.chars += entry.responseChars;
+  }
+  ledger.roundUsage.push({ round: roundNumber, elapsedMs: Number.isFinite(elapsedMs) ? elapsedMs : null, ...(usage && typeof usage === "object" ? usage : {}) });
+  record.lookups = ledger;
+};
+
 export const finishAiRecord = (record, { ok = true, error = "", rawResponse = "" } = {}) => {
   if (!record || record.finished) return;
   record.finished = true;
@@ -194,7 +234,7 @@ export const finishAiRecord = (record, { ok = true, error = "", rawResponse = ""
   record.error = String(error ?? "").slice(0, 2000);
   if (rawResponse) {
     record.responseChars = rawResponse.length;
-    record.rawResponse = clip(rawResponse, MAX_RAW_RESPONSE_CHARS);
+    record.rawResponse = rawResponse;
   }
   // A failed call is final whatever the caller planned to attach.
   if (!ok) record.awaitingOutcome = false;
@@ -319,7 +359,7 @@ const CSV_COLUMNS = [
   "batch", "simulatedDays", "promptTokens", "outputTokens", "cachedTokens",
   "thinkingTokens", "latencyMs", "firstByteMs", "systemPromptChars",
   "responseChars", "staticPrefixEnd", "ok", "validationError", "rating",
-  "eventCount", "stopDate",
+  "eventCount", "stopDate", "lookupRounds", "lookupCalls", "lookupNames",
 ];
 
 const csvCell = (value) => {
@@ -354,6 +394,9 @@ export const exportTelemetryCsv = (records) => {
       record.rating ?? "",
       record.parsedSummary?.eventCount ?? "",
       record.parsedSummary?.stopDate ?? "",
+      record.lookups?.rounds ?? "",
+      record.lookups?.calls ?? "",
+      (record.lookups?.entries ?? []).map((entry) => entry.name).join(" "),
     ].map(csvCell).join(","));
   }
   return rows.join("\n");

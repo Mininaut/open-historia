@@ -9,6 +9,7 @@
 
 import { normalizeEvents, normalizeWorldState } from "../../runtime/gameState.js";
 import { toCountryName } from "../../runtime/ownerNames.js";
+import { compareGameDates, parseGameDate } from "../../runtime/gameDates.js";
 
 export const WAR_LEDGER_VERSION = "0.1.4-adversarial-war-start";
 
@@ -41,18 +42,8 @@ const uniquePolities = (value, limit = 12) => {
   return result;
 };
 
-const parseIsoDate = (value) => {
-  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(normalizeString(value));
-  if (!match) return null;
-  const year = Number(match[1]);
-  const month = Number(match[2]);
-  const day = Number(match[3]);
-  if (year < 1 || month < 1 || month > 12) return null;
-  const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
-  const days = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-  if (day < 1 || day > days[month - 1]) return null;
-  return { year, month, day };
-};
+// Any game date, BC included (runtime/gameDates.js).
+const parseIsoDate = parseGameDate;
 
 const sortDate = (value) => parseIsoDate(value) ? normalizeString(value) : "";
 
@@ -388,10 +379,24 @@ const NON_BATTLEFIELD_ACTION_TERMS_RE = new RegExp(
   "gi",
 );
 
+// "Offensive" is also the ordinary word for a concerted non-military campaign.
+// A player's Iran game queued a démarche for sanctions relief and the model
+// wrote it up faithfully — "Ministry of Foreign Affairs Launches European
+// Diplomatic Offensive for Sanctions Relief" — which ACTIVE_OFFENSIVE_RE read as
+// a launched military offensive with no combatants. The correction the retry
+// sent was about that phantom battle, and on the final attempt the salvage
+// dropped the player's own action from the turn. A qualifier that makes the
+// campaign non-military masks it; real fighting in the same event still trips
+// the battlefield terms, which this leaves untouched. "Cyber" is deliberately
+// not on the list: a cyber offensive is a hostile act, not a figure of speech.
+const NON_BATTLEFIELD_OFFENSIVE_RE =
+  /\b(?:diplomatic|charm|peace|political|media|public[- ]relations|propaganda|information|legal|lobbying|economic|trade|investment|marketing|publicity|messaging)\s+(?:counter[- ]?)?offensives?\b/gi;
+
 const combatSemanticText = (event) =>
   `${normalizeString(event?.title)} ${normalizeString(event?.description)}`
     .replace(NON_BATTLEFIELD_COMBAT_TERMS_RE, " military-equipment ")
-    .replace(NON_BATTLEFIELD_ACTION_TERMS_RE, " military-exercise ");
+    .replace(NON_BATTLEFIELD_ACTION_TERMS_RE, " military-exercise ")
+    .replace(NON_BATTLEFIELD_OFFENSIVE_RE, " non-military-campaign ");
 
 // Semantic WHAT: does the event itself actually describe battlefield combat?
 // This deliberately ignores impacts.unitOps. A post-processor may implement
@@ -909,6 +914,161 @@ export const validateCanonicalWarEvents = ({ events, updates, world } = {}) =>
     requireUpdateLinks: false,
   });
 
+// The words a war transition is narrated with, per operation: how a record is
+// rebound to the event that establishes it when the model's own number and
+// event.warId disagree.
+const WORLD_WAR_TRANSITION_HINTS = Object.freeze({
+  start: /\b(declar(?:e|es|ed|ation)|war begins|hostilities begin|invad(?:e|es|ed|ing|sion)|opens? hostilities)\b/i,
+  "join-a": /\b(joins?|enters?|interven(?:e|es|ed|tion)|declares? war)\b/i,
+  "join-b": /\b(joins?|enters?|interven(?:e|es|ed|tion)|declares? war)\b/i,
+  leave: /\b(leaves?|withdraws?|withdrawal|exits?|separate peace)\b/i,
+  ceasefire: /\b(cease[- ]?fire|armistice|truce|suspends? hostilities)\b/i,
+  resume: /\b(resumes? hostilities|cease[- ]?fire collapses?|armistice collapses?|fighting resumes?)\b/i,
+  end: /\b(peace|surrenders?|capitulat(?:e|es|ed|ion)|war ends?|ends? the war|peace settlement)\b/i,
+});
+
+const transitionText = (event) => `${normalizeString(event?.title)} ${normalizeString(event?.description)}`;
+
+// The model decides WHAT happened; the engine owns which event a war record is
+// bound to. Model-supplied event numbers are hints, rebound here from
+// event.warId plus the transition's own vocabulary, so a wrong number can never
+// bind a declaration to an unrelated event.
+//
+// When nothing on the event side answers to the record — no event carries its
+// warId — the model's own numbers are KEPT. They used to be blanked here, and
+// the validator then told the model to "reference the event number that
+// establishes this transition" for a number it had already given; told the
+// same thing on the retry, it gave the same answer, and a finished turn fell to
+// the canned fallback. Kept, the validator names the real defect instead: the
+// event it points at is missing its warId.
+export const normalizeWorldWarEventLinks = (candidate) => {
+  if (!candidate || typeof candidate !== "object") return { rebound: 0, updates: [] };
+  const events = normalizeArray(candidate?.events);
+  const updates = decodeWarUpdates(candidate?.warUpdates);
+  let rebound = 0;
+
+  const normalized = updates.map((update) => {
+    const warId = normalizeString(update?.id);
+    const supplied = normalizeArray(update?.eventIndexes)
+      .map(Number)
+      .filter((index) => Number.isInteger(index) && index >= 0 && index < events.length);
+
+    const sameWar = events
+      .map((event, index) => ({ event, index }))
+      .filter(({ event }) => normalizeString(event?.warId) === warId);
+
+    const hint = WORLD_WAR_TRANSITION_HINTS[normalizeString(update?.op).toLowerCase()];
+    const semantic = hint ? sameWar.filter(({ event }) => hint.test(transitionText(event))) : [];
+
+    let eventIndexes;
+    if (semantic.length === 1) {
+      eventIndexes = [semantic[0].index];
+    } else if (sameWar.length === 1) {
+      eventIndexes = [sameWar[0].index];
+    } else {
+      // Several events carry this warId, or none does. The model's numbers
+      // choose among the ones that do; failing that, they stand as given.
+      const suppliedSameWar = supplied.filter((index) => normalizeString(events[index]?.warId) === warId);
+      const suppliedSemantic = semantic.length
+        ? suppliedSameWar.filter((index) => semantic.some((row) => row.index === index))
+        : suppliedSameWar;
+      if (suppliedSemantic.length) eventIndexes = [suppliedSemantic[0]];
+      else if (suppliedSameWar.length) eventIndexes = [suppliedSameWar[0]];
+      else eventIndexes = supplied;
+    }
+
+    if (JSON.stringify(eventIndexes) !== JSON.stringify(supplied)) rebound += 1;
+    return { ...update, eventIndexes, eventIds: [] };
+  });
+
+  candidate.warUpdates = normalized;
+  if (rebound) {
+    console.info(`[OH war ledger] rebound ${rebound} record(s) from event.warId and transition semantics.`);
+  }
+  return { rebound, updates: normalized };
+};
+
+// The last attempt's repair, run instead of discarding a finished segment whose
+// war records the model could not fix on its corrective retry.
+//
+// 1. A record's own event numbers are its declaration of the link: every event
+//    it names that carries no warId is stamped with the record's id, and the
+//    batch is rebound and validated again.
+// 2. What still fails is dropped: the first single record whose removal makes
+//    the batch valid, or — when no single removal does — every record of the
+//    segment. An event bound to a war that no kept record creates and that
+//    does not already exist in the world loses its war bindings (warId,
+//    combatants); events of wars that already exist keep theirs.
+// 3. Whatever the validator still says about the remaining narrative (a title
+//    that reads like a declaration with no record behind it, a battle narrated
+//    during a ceasefire) comes back as `residual` for the caller to log and
+//    accept: the events stand as narrative, apply time drops what cannot be
+//    applied (applyWarUpdates) and the merged turn is checked again with a
+//    warning, not a rejection.
+export const repairWarLedgerPayload = (candidate, { world = {} } = {}) => {
+  const result = { stamped: 0, droppedIds: [], strippedEvents: 0, residual: "" };
+  if (!candidate || typeof candidate !== "object") return result;
+  const eventAt = (index) => {
+    const event = normalizeArray(candidate.events)[index];
+    return event && typeof event === "object" ? event : null;
+  };
+
+  for (const update of decodeWarUpdates(candidate.warUpdates)) {
+    const warId = normalizeString(update.id);
+    if (!warId) continue;
+    for (const index of normalizeArray(update.eventIndexes)) {
+      const event = eventAt(index);
+      if (!event || normalizeString(event.warId)) continue;
+      event.warId = warId;
+      result.stamped += 1;
+    }
+  }
+  normalizeWorldWarEventLinks(candidate);
+  if (!validateWarLedgerPayload(candidate, { world })) return result;
+
+  const existing = new Set(normalizedWars(world).map((war) => war.id));
+  const records = decodeWarUpdates(candidate.warUpdates);
+  // War bindings that neither an existing war nor a kept record can honour.
+  const stripBindings = (events, keptIds) => {
+    let stripped = 0;
+    for (const event of events) {
+      if (!event || typeof event !== "object") continue;
+      const warId = normalizeString(event.warId);
+      if (!warId || existing.has(warId) || keptIds.has(warId)) continue;
+      event.warId = "";
+      if (Array.isArray(event.combatants) && event.combatants.length) event.combatants = [];
+      stripped += 1;
+    }
+    return stripped;
+  };
+  const idsOf = (list) => new Set(list.map((update) => normalizeString(update.id)));
+  const trial = (keep) => {
+    const copy = {
+      ...candidate,
+      events: normalizeArray(candidate.events).map((event) => (event && typeof event === "object" ? { ...event } : event)),
+      warUpdates: keep.map((update) => ({ ...update })),
+    };
+    stripBindings(copy.events, idsOf(keep));
+    normalizeWorldWarEventLinks(copy);
+    return validateWarLedgerPayload(copy, { world });
+  };
+
+  let keep = null;
+  for (let index = 0; index < records.length && !keep; index += 1) {
+    const rest = records.filter((_, position) => position !== index);
+    if (!trial(rest)) keep = rest;
+  }
+  if (!keep) keep = [];
+
+  const keptIds = idsOf(keep);
+  result.droppedIds = records.map((update) => normalizeString(update.id)).filter((id) => !keptIds.has(id));
+  result.strippedEvents = stripBindings(normalizeArray(candidate.events), keptIds);
+  candidate.warUpdates = keep;
+  normalizeWorldWarEventLinks(candidate);
+  result.residual = validateWarLedgerPayload(candidate, { world });
+  return result;
+};
+
 export const applyWarUpdates = ({ world, updates, events = [], stopDate = "", round = 0 } = {}) => {
   const nextWorld = normalizeWorldState(world);
   const map = warMapFromWorld(nextWorld);
@@ -932,7 +1092,7 @@ export const applyWarUpdates = ({ world, updates, events = [], stopDate = "", ro
     .filter(Boolean)
     .sort((a, b) =>
       (statusRank[a.status] ?? 9) - (statusRank[b.status] ?? 9) ||
-      String(b.lastUpdatedDate || b.startedDate || "").localeCompare(String(a.lastUpdatedDate || a.startedDate || "")) ||
+      compareGameDates(b.lastUpdatedDate || b.startedDate || "", a.lastUpdatedDate || a.startedDate || "") ||
       a.id.localeCompare(b.id)
     )
     .slice(0, MAX_WARS);

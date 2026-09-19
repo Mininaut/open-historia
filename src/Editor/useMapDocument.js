@@ -1,6 +1,6 @@
 /*!
  * Open Historia Map Editor
- * Copyright (c) 2026 Nicholas Krol - MIT License (see src/Editor/LICENSE).
+ * Copyright (c) 2026 Nicholas Krol - AGPL-3.0-or-later (see LICENSE).
  */
 
 // Map-editor document state: the single source of truth for a map's metadata,
@@ -12,6 +12,8 @@
 import { useCallback, useEffect, useState } from "react";
 import { OWNER_SCHEMA } from "./documentMigration.js";
 import { normalizeTagList } from "../runtime/countryTags.js";
+import { renamePolityInDocument } from "../../server/polityRename.js";
+import { mergeCityMarkers } from "./cityMarkers.js";
 
 // The official editor ships a handful of region "types" carrying render +
 // gameplay settings. We seed the two core ones (Land / Coastal); users add more.
@@ -73,6 +75,9 @@ export const createDocument = ({ name = "Untitled Map", kind = "import-world" } 
     },
     types: structuredClone(DEFAULT_TYPES),
     features: [],
+    // Starting units (world.units, source "scenario"): what stands on the map at
+    // round one. Placed with the Unit tool; the game moves them from there.
+    units: [],
     // The map-maker's own choices, and the only colour/flag state that belongs to
     // the document. The base palette (293 countries) and any scenario palette are
     // fetched at mount and merged for display only — saving those into every doc
@@ -206,28 +211,21 @@ export const useMapDocument = (initial) => {
     setSaveStatus("dirty");
   }, []);
 
-  // Rename the CURRENT DISPLAY name without touching the stable key used by
-  // regions, flags, tags, colors and campaign continuity. This is the operation
-  // scenario authors actually mean by "Austria -> Austria-Hungary".
-  const renamePolityDisplay = useCallback((key, nextName) => {
-    const stableKey = String(key || "").trim();
-    const name = String(nextName || "").trim();
-    if (!stableKey || !name) return;
+  // Renaming a polity re-keys it: the record moves to the new name and every
+  // colour, flag, tag and city marker keyed by the old one follows, with the old
+  // name kept as a former name (server/polityRename.js). The map's regions are
+  // re-keyed by OlMap.renameOwner; MapEditor calls both.
+  const renamePolity = useCallback((key, nextName) => {
+    const from = String(key || "").trim();
+    const to = String(nextName || "").trim();
+    if (!from || !to) return;
     setDoc((d) => {
-      const current = d.polities?.[stableKey] || { name: stableKey, aliases: [] };
-      const oldName = String(current.name || stableKey).trim();
-      const aliases = [...new Set([
-        ...(Array.isArray(current.aliases) ? current.aliases : []),
-        oldName,
-        name,
-      ].map((v) => String(v || "").trim()).filter(Boolean))];
-      return {
-        ...d,
-        polities: {
-          ...(d.polities || {}),
-          [stableKey]: { ...current, code: current.code || stableKey, name, aliases },
-        },
-      };
+      try {
+        return renamePolityInDocument(d, from, to);
+      } catch (error) {
+        console.warn("[editor] polity rename refused:", error);
+        return d;
+      }
     });
     setSaveStatus("dirty");
   }, []);
@@ -244,6 +242,25 @@ export const useMapDocument = (initial) => {
       delete colorOverrides[stableKey];
       delete flags[stableKey];
       delete tags[stableKey];
+      return { ...d, polities, colorOverrides, flags, tags };
+    });
+    setSaveStatus("dirty");
+  }, []);
+
+  const removePolities = useCallback((keys) => {
+    const stableKeys = [...new Set((keys || []).map((key) => String(key || "").trim()).filter(Boolean))];
+    if (!stableKeys.length) return;
+    setDoc((d) => {
+      const polities = { ...(d.polities || {}) };
+      const colorOverrides = { ...(d.colorOverrides || {}) };
+      const flags = { ...(d.flags || {}) };
+      const tags = { ...(d.tags || {}) };
+      for (const stableKey of stableKeys) {
+        delete polities[stableKey];
+        delete colorOverrides[stableKey];
+        delete flags[stableKey];
+        delete tags[stableKey];
+      }
       return { ...d, polities, colorOverrides, flags, tags };
     });
     setSaveStatus("dirty");
@@ -367,6 +384,22 @@ export const useMapDocument = (initial) => {
     return summary;
   }, [doc.polities]);
 
+  // City markers from the Province Map Importer (its "Import explicit city Point
+  // markers" option): the rows collectImportedCityPoints builds become point
+  // features next to the hand-placed ones, so they reach the scenario's
+  // cities.geojson through buildGameSeed like any other city. The merge itself is
+  // the import-free cityMarkers.js; this is the state wrapper. Returns the
+  // summary the importer's status line reports ({ count, created, updated,
+  // replaced, skipped }) — computed from the document as it is now; the state
+  // update recomputes on whatever the document is when React applies it.
+  const importCityMarkers = useCallback((rows, { replaceExisting = false } = {}) => {
+    const options = { replaceExisting, nextId: () => newId("feat") };
+    const { count, created, updated, replaced, skipped } = mergeCityMarkers(doc.features, rows, options);
+    setDoc((d) => ({ ...d, features: mergeCityMarkers(d.features, rows, options).features }));
+    setSaveStatus("dirty");
+    return { count, created, updated, replaced, skipped };
+  }, [doc.features]);
+
   const patchMetadata = useCallback((patch) => {
     setDoc((d) => ({ ...d, metadata: { ...d.metadata, ...patch } }));
     setSaveStatus("dirty");
@@ -380,6 +413,10 @@ export const useMapDocument = (initial) => {
   }, []);
   const setFeatures = useCallback((updater) => {
     setDoc((d) => ({ ...d, features: typeof updater === "function" ? updater(d.features) : updater }));
+    setSaveStatus("dirty");
+  }, []);
+  const setUnits = useCallback((updater) => {
+    setDoc((d) => ({ ...d, units: typeof updater === "function" ? updater(d.units || []) : (updater || []) }));
     setSaveStatus("dirty");
   }, []);
 
@@ -402,14 +439,18 @@ export const useMapDocument = (initial) => {
     polities: doc.polities || {},
     setPolities,
     upsertPolity,
-    renamePolityDisplay,
+    renamePolity,
     removePolity,
+    removePolities,
     importPolityRoster,
+    importCityMarkers,
     mergeColors,
     types: doc.types,
     setTypes,
     features: doc.features,
     setFeatures,
+    units: doc.units || [],
+    setUnits,
     metadata: doc.metadata,
     basemap: doc.metadata.basemap,
     setBasemap,
@@ -429,6 +470,7 @@ export const useMapDocument = (initial) => {
     counts: {
       regions: regionCount,
       features: doc.features.length,
+      units: (doc.units || []).length,
       types: doc.types.length,
     },
   };

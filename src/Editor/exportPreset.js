@@ -1,6 +1,6 @@
 /*!
  * Open Historia Map Editor
- * Copyright (c) 2026 Nicholas Krol - MIT License (see src/Editor/LICENSE).
+ * Copyright (c) 2026 Nicholas Krol - AGPL-3.0-or-later (see LICENSE).
  */
 
 // Turn an edited map into a game-playable seed.
@@ -171,9 +171,38 @@ const buildBackgroundForGame = (customBackground) => {
 // the model that it exists at all.
 const STOCK_COUNTRY_NAMES = new Set(Object.values(COUNTRY_NAMES));
 
+// The scenario's starting units, in the game's own unit shape: a unit the
+// author placed ships with source "scenario" and stands on the map at round
+// one; the game normalises it again on read (normalizeUnitEntry).
+const buildUnitsForGame = (units) => (Array.isArray(units) ? units : [])
+  .map((unit, index) => {
+    const lng = Number(unit?.lng);
+    const lat = Number(unit?.lat);
+    const ownerCode = String(unit?.ownerCode || "").trim();
+    if (!Number.isFinite(lng) || !Number.isFinite(lat) || !ownerCode) return null;
+    const strength = Number(unit?.strength);
+    return {
+      id: String(unit?.id || `scenario-unit-${index + 1}`),
+      name: String(unit?.name || "").trim() || "Unit",
+      type: String(unit?.type || "infantry").trim().toLowerCase() || "infantry",
+      ownerCode,
+      strength: Number.isFinite(strength) ? Math.max(1, Math.min(100, Math.round(strength))) : 100,
+      lng: Number(lng.toFixed(5)),
+      lat: Number(lat.toFixed(5)),
+      composition: String(unit?.composition || "").trim(),
+      note: String(unit?.note || "").trim(),
+      status: "idle",
+      source: "scenario",
+    };
+  })
+  .filter(Boolean);
+
 export const buildGameSeed = (doc, regionsFC, palette = {}, { playerCountry } = {}) => {
   const regionOwnershipOverrides = {};
   const owners = new Set();
+  // Polities that are on the map only as claimants: a region is disputed in
+  // their name and renders striped in their colour, so the game must know them.
+  const claimants = new Set();
   let customCount = 0;
 
   for (const f of regionsFC?.features || []) {
@@ -185,6 +214,10 @@ export const buildGameSeed = (doc, regionsFC, palette = {}, { playerCountry } = 
     if (owner) {
       regionOwnershipOverrides[id] = owner;
       owners.add(owner);
+    }
+    for (const claimant of Array.isArray(props.claimants) ? props.claimants : []) {
+      const key = String(claimant || "").trim();
+      if (key) claimants.add(key);
     }
   }
 
@@ -237,10 +270,13 @@ export const buildGameSeed = (doc, regionsFC, palette = {}, { playerCountry } = 
   };
 
   for (const owner of owners) emitPolity(owner, declaredPolities[owner]);
-  // Landless governments/exiles and other explicit scenario actors have no region
-  // to discover them from, so the document registry must be included independently.
-  for (const [key, record] of Object.entries(declaredPolities)) {
-    if (!owners.has(key)) emitPolity(key, record);
+  for (const key of claimants) if (!owners.has(key)) emitPolity(key, declaredPolities[key]);
+  // And every country the author registered without giving it a region yet: a
+  // registered country is a country to the game, land or no land — a government
+  // in exile, a nation waiting to be painted. Removing one is the Countries
+  // panel's explicit "Remove from the map", never a side effect of painting.
+  for (const key of Object.keys(declaredPolities)) {
+    if (!owners.has(key) && !claimants.has(key)) emitPolity(key, declaredPolities[key]);
   }
 
   const author = (doc.metadata?.author || "").trim();
@@ -250,6 +286,8 @@ export const buildGameSeed = (doc, regionsFC, palette = {}, { playerCountry } = 
     ownerSchema: doc.ownerSchema ?? OWNER_SCHEMA,
     regionOwnershipOverrides,
     polityOverrides,
+    // The starting units the author placed (Units panel / Unit tool).
+    units: buildUnitsForGame(doc.units),
     // A custom background replaces Earth, so it must also hide the stock modern
     // political overlay (country fills, borders, "Russia"/"France" labels) — those
     // are gated on customRegions in the game, so force it on whenever there's a
@@ -266,7 +304,11 @@ export const buildGameSeed = (doc, regionsFC, palette = {}, { playerCountry } = 
     // Authored cities replace the modern city labels. A custom-geometry map with
     // no cities still sets the flag — modern names over invented land would be
     // wrong — while a pure re-ownership map without cities keeps the stock set.
-    customCities: gameCities.features.length > 0 || hasCustomGeometry,
+    // citiesAuthored separates "never had cities" from "deleted them all".
+    customCities:
+      gameCities.features.length > 0
+      || hasCustomGeometry
+      || Boolean(doc.metadata?.citiesAuthored),
     author,
     mapCredit: author ? `Made by ${author}` : "",
     simulationRules: doc.metadata?.simulationRules || "",

@@ -1,4 +1,4 @@
-/*! Open Historia — cheats panel © 2026 Nicholas Krol, MIT (see src/Editor/LICENSE). */
+/*! Open Historia — cheats panel © 2026 Nicholas Krol, AGPL-3.0-or-later (see LICENSE). */
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
     JSON_URLS,
@@ -20,14 +20,51 @@ import {
 } from "../../runtime/gameState.js";
 import COUNTRY_NAMES from "../../runtime/generated/countryNames.js";
 import { DIFFICULTY_LEVELS, normalizeDifficulty } from "../../runtime/difficulty.js";
-import { applyGameMasterPreview, previewGameMasterCommand } from "../AI/gameplay.js";
+import { applyGameMasterPreview, consolidateHistoryNow, previewGameMasterCommand } from "../AI/gameplayLazy.js";
+import { HISTORY_CONSOLIDATION, countWords, describeHistoryConsolidation, planHistoryConsolidation } from "../AI/historyConsolidation.js";
 import { setRegionClickInterceptor } from "../Selection/Regions.jsx";
+import { compareGameDates, formatGameDateReadable, isGameDate } from "../../runtime/gameDates.js";
+import {
+    REMINDERS_LIMIT,
+    REMINDER_MAX_CHARS,
+    addReminder,
+    editReminder,
+    gmChangeKindLabel,
+    gmChangesForRound,
+    normalizeReminders,
+    recordGmChange,
+    removeReminder,
+} from "../../runtime/gmChanges.js";
 
 const PANEL_TOP = "4.75rem";
 const EMPTY_FEATURES = { type: "FeatureCollection", features: [] };
 
+const capitalize = (text) => String(text ?? "").replace(/^./, (first) => first.toUpperCase());
+
+// Every tool in this panel changes the world outside the simulation, and the
+// next time skip is told so, once (runtime/gmChanges.js). A small world write of
+// its own after the tool's save has succeeded, so no tool's save path changes
+// shape — and a note that fails costs the note, never the edit.
+// `step` ({ group, template, item }) is one step of a change made in many — a
+// border redrawn region by region — and joins the line that change is building.
+const noteGmChange = async (kind, summary, step = null) => {
+    try {
+        const [world, game] = await Promise.all([readWorldState({ force: true }), readGameData({ force: true })]);
+        await writeWorldState(recordGmChange(world, {
+            kind,
+            summary,
+            round: Number(game?.round) || 0,
+            date: String(game?.gameDate || game?.startDate || ""),
+            ...(step || {}),
+        }));
+    } catch (error) {
+        console.warn("[cheats] the change was made, but the note for the next time skip was not:", error);
+    }
+};
+
 const TOOLS = [
     { id: "master-ai", title: "GM Console", subtitle: "Master AI · AI-assisted world intervention and canonical changes", icon: "✦", badge: "AI" },
+    { id: "reminders", title: "Simulation Reminders", subtitle: "Standing facts every AI in the game is told until you withdraw them — and what the next skip will hear", icon: "❖" },
     { id: "roll-back-turn", title: "Roll Back Turn", subtitle: "Restore the game to the start of an earlier turn", icon: "↶" },
     { id: "your-country", title: "Play As Country", subtitle: "Change which country you're currently controlling", icon: "♛" },
     { id: "difficulty", title: "Difficulty", subtitle: "Tune simulation rigor without anti-player bias", icon: "◈" },
@@ -40,7 +77,7 @@ const TOOLS = [
     { id: "add-feature", title: "Add Map Feature", subtitle: "Place cities, HQs, landmarks, ports, and other world features", icon: "+" },
     { id: "clear-features", title: "Clear Map Features", subtitle: "Remove custom features or restore standard cities", icon: "⌫", badge: "Advanced" },
     { id: "events", title: "Event Editor", subtitle: "Search, create, and repair canonical timeline events", icon: "≡" },
-    { id: "logs", title: "Diagnostics Log", subtitle: "Errors, API failures and the context the AI was given", icon: "≣" },
+    { id: "history-document", title: "History Document", subtitle: "Read and edit the living history the AI is given in place of older events; the timeline keeps every event", icon: "≣" },
 ];
 
 const TOOL_GROUPS = [
@@ -49,7 +86,7 @@ const TOOL_GROUPS = [
         title: "GM & History",
         subtitle: "Intervene in the world, repair canon, or restore an earlier state.",
         icon: "✦",
-        tools: ["master-ai", "events", "roll-back-turn"],
+        tools: ["master-ai", "reminders", "events", "history-document", "roll-back-turn"],
     },
     {
         id: "countries-territory",
@@ -70,7 +107,7 @@ const TOOL_GROUPS = [
         title: "Simulation",
         subtitle: "Change player control and simulation challenge settings.",
         icon: "◈",
-        tools: ["difficulty", "your-country", "logs"],
+        tools: ["difficulty", "your-country"],
     },
     {
         id: "map",
@@ -348,7 +385,7 @@ const CheatsPanel = ({ open, onClose, onOpenForces }) => {
             position: "fixed",
             right: "0.65rem",
             top: PANEL_TOP,
-            width: ["edit-country", "events", "edit-feature", "add-feature"].includes(tool) ? "min(31rem, calc(100vw - 1rem))" : "min(25.5rem, calc(100vw - 1rem))",
+            width: ["edit-country", "events", "history-document", "edit-feature", "add-feature"].includes(tool) ? "min(31rem, calc(100vw - 1rem))" : "min(25.5rem, calc(100vw - 1rem))",
             zIndex: 10045,
         }}
         >
@@ -665,6 +702,16 @@ const CountryEditorView = ({ meta, header, busy, status, polities, refresh, runB
         };
         world.polityOverrides = { ...(world.polityOverrides || {}), [target]: nextOverride };
 
+        // Before the patch, for the one-line note the next time skip is given.
+        const previousName = String(existing.name || nameOf.get(target) || target).trim();
+        const sheetBefore = world.countryStats?.[target] ?? null;
+        const headlineBefore = {
+            leader: String(sheetBefore?.leader ?? "").trim(),
+            government: String(sheetBefore?.government ?? "").trim(),
+            capital: String(sheetBefore?.capital ?? "").trim(),
+            stability: Number.isFinite(Number(sheetBefore?.stability)) ? Number(sheetBefore.stability) : null,
+        };
+
         let nextSheet = world.countryStats?.[target] ?? null;
         if (hasComponentBaseline) {
             const populationM = editorNumber(form.populationM, { min: 0.001, max: 20000, label: "Population (millions)" });
@@ -734,6 +781,19 @@ const CountryEditorView = ({ meta, header, busy, status, polities, refresh, runB
             const colors = await readJson(JSON_URLS.colors, { defaultValue: {}, force: true });
             await writeJson(JSON_URLS.colors, { ...colors, [target]: rgb }, { pretty: true });
         }
+
+        const edits = [
+            previousName && previousName !== nextName ? `renamed it from ${previousName}` : "",
+            ...["leader", "government", "capital"].map((key) => {
+                const after = String(nextSheet?.[key] ?? "").trim();
+                return after && after !== headlineBefore[key] ? `${key}: ${after}` : "";
+            }),
+            Number.isFinite(Number(nextSheet?.stability)) && Number(nextSheet.stability) !== headlineBefore.stability
+                ? `stability ${headlineBefore.stability ?? "unset"} → ${Number(nextSheet.stability)}`
+                : "",
+        ].filter(Boolean);
+        await noteGmChange(hasComponentBaseline ? "stats" : "polity",
+            `Edited ${nextName} in the country editor${edits.length ? `: ${edits.join("; ")}` : " (its figures and details)"}.`);
 
         if (typeof window !== "undefined") {
             window.dispatchEvent(new CustomEvent("oh:country-stats-updated", {
@@ -1077,7 +1137,7 @@ const sortEventsChronologically = (events) => events
     .sort((left, right) => {
         const leftDate = cleanEventText(left.event?.date);
         const rightDate = cleanEventText(right.event?.date);
-        if (leftDate && rightDate && leftDate !== rightDate) return leftDate.localeCompare(rightDate);
+        if (leftDate && rightDate && leftDate !== rightDate) return compareGameDates(leftDate, rightDate);
         if (leftDate && !rightDate) return -1;
         if (!leftDate && rightDate) return 1;
         const leftCreated = cleanEventText(left.event?.createdAt);
@@ -1087,7 +1147,7 @@ const sortEventsChronologically = (events) => events
     })
     .map(({ event }) => event);
 
-const eventDateLooksIso = (value) => /^\d{4}-\d{2}-\d{2}$/.test(cleanEventText(value));
+const eventDateLooksIso = (value) => isGameDate(cleanEventText(value));
 
 const historyEntryDate = (entry) => cleanEventText(entry?.toDate || entry?.date || entry?.fromDate);
 
@@ -1161,7 +1221,7 @@ const syncManualEventTimelineHistory = (worldInput, eventsInput, game) => {
             return true;
         });
 
-    const orderedManual = [...manualEvents].sort((a, b) => cleanEventText(a.date).localeCompare(cleanEventText(b.date)));
+    const orderedManual = [...manualEvents].sort((a, b) => compareGameDates(cleanEventText(a.date), cleanEventText(b.date)));
 
     for (const event of orderedManual) {
         const eventId = cleanEventText(event.id);
@@ -1178,7 +1238,6 @@ const syncManualEventTimelineHistory = (worldInput, eventsInput, game) => {
         }
 
         const manualRecord = {
-            catalyst: null,
             date,
             eventIds: [eventId],
             fallbackReason: "",
@@ -1193,7 +1252,7 @@ const syncManualEventTimelineHistory = (worldInput, eventsInput, game) => {
 
         let insertAt = history.findIndex((entry) => {
             const entryDate = historyEntryDate(entry);
-            return eventDateLooksIso(date) && eventDateLooksIso(entryDate) && date > entryDate;
+            return eventDateLooksIso(date) && eventDateLooksIso(entryDate) && compareGameDates(date, entryDate) > 0;
         });
         if (insertAt < 0) insertAt = history.length;
         history.splice(insertAt, 0, manualRecord);
@@ -1227,6 +1286,162 @@ const eventFilterButtonStyle = (active) => ({
     fontSize: "0.66rem",
     padding: "0.36rem 0.5rem",
 });
+
+// Simulation Reminders (runtime/gmChanges.js): the Game Master's standing facts,
+// given to every AI in the game until they are withdrawn — and beneath them, the
+// changes made by hand this round, which is exactly what the next time skip
+// will be told. Nothing here costs a request.
+const RemindersView = ({ meta, header, busy, status, game, runBusy }) => {
+    const [world, setWorld] = useState(null);
+    const [draft, setDraft] = useState("");
+    const [editingId, setEditingId] = useState(null);
+    const [editText, setEditText] = useState("");
+
+    const load = async () => {
+        const next = await readWorldState({ force: true });
+        setWorld(next);
+        return next;
+    };
+    // Loaded once on entry; every action below reloads it.
+    useEffect(() => {
+        let cancelled = false;
+        readWorldState({ force: true })
+            .then((next) => { if (!cancelled) setWorld(next); })
+            .catch(() => { if (!cancelled) setWorld({}); });
+        return () => { cancelled = true; };
+    }, []);
+
+    const round = Number(game?.round) || 0;
+    const date = String(game?.gameDate || game?.startDate || "");
+    const reminders = normalizeReminders(world?.simulationReminders);
+    const pending = world ? gmChangesForRound(world, round) : [];
+    const readable = (value) => (value ? formatGameDateReadable(value) : "");
+
+    const issue = () => runBusy(async () => {
+        const text = draft.trim();
+        if (!text) throw new Error("Write the reminder first.");
+        const current = await readWorldState({ force: true });
+        if (normalizeReminders(current.simulationReminders).length >= REMINDERS_LIMIT) {
+            throw new Error(`There can be ${REMINDERS_LIMIT} reminders at once. Withdraw one that no longer holds first.`);
+        }
+        await writeWorldState(addReminder(current, { text, round, date }));
+        setDraft("");
+        await load();
+        return "Reminder issued. Every AI in the game is told it from its next call.";
+    });
+
+    const saveEdit = (id) => runBusy(async () => {
+        const text = editText.trim();
+        if (!text) throw new Error("A reminder cannot be empty — withdraw it instead.");
+        const current = await readWorldState({ force: true });
+        await writeWorldState(editReminder(current, id, text));
+        setEditingId(null);
+        await load();
+        return "Reminder updated. The next call is told the new wording.";
+    });
+
+    const withdraw = (id) => runBusy(async () => {
+        const current = await readWorldState({ force: true });
+        await writeWorldState(removeReminder(current, id, { round, date }));
+        if (editingId === id) setEditingId(null);
+        await load();
+        return "Reminder withdrawn. The next time skip is told it no longer holds.";
+    });
+
+    const cardStyle = { background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.08)", borderRadius: 8, padding: "0.5rem 0.6rem" };
+    const noteStyle = { color: "rgba(255,255,255,0.48)", fontSize: "0.68rem", lineHeight: 1.45 };
+    const statusLine = status && (
+        <div style={{ color: status.startsWith("Failed") ? "#fca5a5" : "rgba(191,219,254,0.9)", fontSize: "0.72rem", marginTop: "0.55rem" }}>
+            {status}
+        </div>
+    );
+
+    return (
+        <>
+        {header(meta.title, meta.subtitle)}
+        <div style={{ display: "flex", flex: 1, flexDirection: "column", gap: "0.55rem", minHeight: 0, overflowY: "auto", paddingRight: "0.12rem" }}>
+            <div style={noteStyle}>
+                A reminder is a fact you declare for this game — "the Kerch bridge is down", "the harvest has failed across the south". The time skip, the checks after it, the advisor and every leader are told it on each call, ahead of the lore and the starting borders, until you withdraw it. Every AI sees every reminder, so keep secrets out of them.
+            </div>
+
+            <div style={editorFieldStyle}>
+                <div style={editorSectionLabelStyle}>Issue a reminder</div>
+                <textarea
+                    value={draft}
+                    onChange={(event) => setDraft(event.target.value)}
+                    placeholder="The Kerch bridge is destroyed and cannot be crossed until it is rebuilt."
+                    rows={3}
+                    maxLength={REMINDER_MAX_CHARS}
+                    style={{ ...inputStyle, fontFamily: "inherit", resize: "vertical", width: "100%" }}
+                />
+                <button type="button" disabled={busy || !draft.trim()} onClick={issue} style={{ ...primaryButtonStyle, marginTop: "0.45rem", width: "100%" }}>
+                    Issue reminder
+                </button>
+            </div>
+
+            <div style={editorFieldStyle}>
+                <div style={editorSectionLabelStyle}>Standing reminders · {reminders.length} of {REMINDERS_LIMIT}</div>
+                {world === null && <div style={noteStyle}>Loading…</div>}
+                {world !== null && reminders.length === 0 && <div style={noteStyle}>None. Every AI is working from the record alone.</div>}
+                <div style={{ display: "flex", flexDirection: "column", gap: "0.35rem" }}>
+                    {reminders.map((entry) => (
+                        <div key={entry.id} style={cardStyle}>
+                            {editingId === entry.id ? (
+                                <>
+                                <textarea
+                                    value={editText}
+                                    onChange={(event) => setEditText(event.target.value)}
+                                    rows={3}
+                                    maxLength={REMINDER_MAX_CHARS}
+                                    style={{ ...inputStyle, fontFamily: "inherit", resize: "vertical", width: "100%" }}
+                                />
+                                <div style={{ display: "flex", gap: "0.35rem", marginTop: "0.4rem" }}>
+                                    <button type="button" disabled={busy} onClick={() => saveEdit(entry.id)} style={{ ...primaryButtonStyle, flex: 1 }}>Save</button>
+                                    <button type="button" disabled={busy} onClick={() => setEditingId(null)} style={{ ...buttonStyle, flex: 1 }}>Cancel</button>
+                                </div>
+                                </>
+                            ) : (
+                                <>
+                                <div style={{ fontSize: "0.76rem", lineHeight: 1.45, whiteSpace: "pre-wrap" }}>{entry.text}</div>
+                                <div style={{ alignItems: "center", display: "flex", gap: "0.35rem", justifyContent: "space-between", marginTop: "0.35rem" }}>
+                                    <span style={{ color: "rgba(255,255,255,0.38)", fontSize: "0.62rem" }}>
+                                        {entry.date ? `since ${readable(entry.date)}` : ""}{entry.round ? ` · round ${entry.round}` : ""}
+                                    </span>
+                                    <span style={{ display: "flex", gap: "0.3rem" }}>
+                                        <button type="button" disabled={busy} onClick={() => { setEditingId(entry.id); setEditText(entry.text); }} style={{ ...buttonStyle, fontSize: "0.64rem", padding: "0.22rem 0.45rem" }}>Edit</button>
+                                        <button type="button" disabled={busy} onClick={() => withdraw(entry.id)} style={{ ...buttonStyle, borderColor: "rgba(244,63,94,0.32)", color: "#fda4af", fontSize: "0.64rem", padding: "0.22rem 0.45rem" }}>Withdraw</button>
+                                    </span>
+                                </div>
+                                </>
+                            )}
+                        </div>
+                    ))}
+                </div>
+            </div>
+
+            <div style={editorFieldStyle}>
+                <div style={editorSectionLabelStyle}>What the next time skip will be told</div>
+                <div style={{ ...noteStyle, marginBottom: "0.4rem" }}>
+                    Every change made by hand this round — here, in the GM console or with any other tool in this panel. The skip hears them once, as acts of authority it must not undo.
+                </div>
+                {pending.length === 0
+                    ? <div style={noteStyle}>Nothing has been changed by hand this round.</div>
+                    : (
+                        <div style={{ display: "flex", flexDirection: "column", gap: "0.3rem" }}>
+                            {pending.map((entry) => (
+                                <div key={entry.id} style={{ ...cardStyle, fontSize: "0.7rem", lineHeight: 1.4 }}>
+                                    <span style={{ color: "rgba(196,181,253,0.85)", fontSize: "0.6rem", fontWeight: 750, marginRight: "0.4rem", textTransform: "uppercase" }}>{gmChangeKindLabel(entry.kind)}</span>
+                                    {entry.summary}
+                                </div>
+                            ))}
+                        </div>
+                    )}
+            </div>
+            {statusLine}
+        </div>
+        </>
+    );
+};
 
 const EventEditorView = ({ meta, header, busy, status, game, runBusy }) => {
     const [events, setEvents] = useState(null);
@@ -1454,7 +1669,7 @@ const EventEditorView = ({ meta, header, busy, status, game, runBusy }) => {
             return haystack.includes(q);
         });
         return list.sort((a, b) => {
-            const dateCompare = cleanEventText(a.event?.date).localeCompare(cleanEventText(b.event?.date));
+            const dateCompare = compareGameDates(cleanEventText(a.event?.date), cleanEventText(b.event?.date));
             const createdCompare = cleanEventText(a.event?.createdAt).localeCompare(cleanEventText(b.event?.createdAt));
             const sourceCompare = a.sourceIndex - b.sourceIndex;
             const result = dateCompare || createdCompare || sourceCompare;
@@ -1603,7 +1818,7 @@ const EventEditorView = ({ meta, header, busy, status, game, runBusy }) => {
     return (
         <>
         {header(meta.title, meta.subtitle)}
-        <div style={{ display: "flex", flex: 1, flexDirection: "column", minHeight: 0 }}>
+        <div style={{ display: "flex", flex: 1, flexDirection: "column", minHeight: 0, overflowY: "auto", paddingRight: "0.12rem" }}>
             <div style={{
                 background: "linear-gradient(135deg, rgba(59,130,246,0.09), rgba(124,58,237,0.08))",
                 border: "1px solid rgba(96,165,250,0.2)",
@@ -1686,6 +1901,7 @@ const EventEditorView = ({ meta, header, busy, status, game, runBusy }) => {
                                 if (createForm.allowNpcReactions) {
                                     await syncReactionQueueForEvent(persistedEvent, true);
                                 }
+                                await noteGmChange("timeline", `Wrote the event "${title}" (${date}) into the record by hand.`);
                                 setCreating(false);
                                 setCreateForm({});
                                 setFilter("all");
@@ -1732,7 +1948,7 @@ const EventEditorView = ({ meta, header, busy, status, game, runBusy }) => {
                 </span>
             </div>
 
-            <div style={{ display: "flex", flex: 1, flexDirection: "column", gap: "0.4rem", marginTop: "0.5rem", minHeight: 0, overflowY: "auto", paddingRight: "0.12rem" }}>
+            <div style={{ display: "flex", flexDirection: "column", gap: "0.4rem", marginTop: "0.5rem" }}>
                 {events === null && <div style={{ color: "rgba(255,255,255,0.45)", fontSize: "0.74rem", padding: "0.5rem" }}>Loading canonical timeline…</div>}
                 {events !== null && filtered.length === 0 && <div style={{ color: "rgba(255,255,255,0.45)", fontSize: "0.74rem", padding: "0.5rem" }}>No matching events.</div>}
 
@@ -1770,6 +1986,7 @@ const EventEditorView = ({ meta, header, busy, status, game, runBusy }) => {
                                             void runBusy(async () => {
                                                 await persist((events ?? []).filter((_, index) => index !== sourceIndex));
                                                 await syncReactionQueueForEvent(event, false);
+                                                await noteGmChange("timeline", `Deleted the event "${cleanEventText(event.title) || "untitled"}"${cleanEventText(event.date) ? ` (${cleanEventText(event.date)})` : ""} from the record${impact.count ? "; what it changed on the map was left as it is" : ""}.`);
                                                 if (editingKey === editorKey) setEditingKey(null);
                                                 return pendingReaction
                                                     ? "Event removed from canonical history and its pending diplomatic reaction was cancelled. Existing world state was left untouched."
@@ -1911,6 +2128,16 @@ const EventEditorView = ({ meta, header, busy, status, game, runBusy }) => {
                                                 if (persistedEvent) {
                                                     await syncReactionQueueForEvent(persistedEvent, enabled, { restart: deliberatelyReenabled });
                                                 }
+                                                // Only what the record now SAYS differently — a badge or a
+                                                // reaction switch is not news to the simulation.
+                                                const rewritten = [
+                                                    cleanEventText(event.title) !== title ? `retitled it "${title}"` : "",
+                                                    cleanEventText(event.date) !== date ? `redated it to ${date}` : "",
+                                                    cleanEventText(event.description) !== description ? "rewrote what it says" : "",
+                                                ].filter(Boolean);
+                                                if (rewritten.length) {
+                                                    await noteGmChange("timeline", `Edited the event "${cleanEventText(event.title) || title}" by hand: ${rewritten.join(", ")}.`);
+                                                }
                                                 setEditingKey(null);
                                                 setEditForm({});
                                                 return `Canonical event updated: ${title}`;
@@ -1939,85 +2166,13 @@ const EventEditorView = ({ meta, header, busy, status, game, runBusy }) => {
     );
 };
 
-// Reads the shared diagnostics log. Newest first, because the thing that just
-// went wrong is what the reporter is looking at.
-const LEVEL_TONE = { error: "#ff6b6b", warn: "#ffc861", info: "rgba(255,255,255,0.72)", debug: "rgba(255,255,255,0.45)" };
-
-const LogsPanel = ({ header }) => {
-    const [entries, setEntries] = React.useState([]);
-    const [file, setFile] = React.useState("");
-    const [onlyProblems, setOnlyProblems] = React.useState(false);
-    const [expanded, setExpanded] = React.useState(null);
-    const [note, setNote] = React.useState("");
-
-    const load = React.useCallback(async () => {
-        try {
-            const response = await fetch("/api/log?limit=500", { cache: "no-store" });
-            const data = await response.json();
-            setEntries(Array.isArray(data.entries) ? data.entries.slice().reverse() : []);
-            setFile(String(data.file || ""));
-        } catch (error) {
-            setNote(`Could not read the log: ${error.message}`);
-        }
-    }, []);
-
-    React.useEffect(() => { load(); }, [load]);
-
-    const shown = onlyProblems ? entries.filter((e) => e.level === "error" || e.level === "warn") : entries;
-
-    const copyAll = async () => {
-        try {
-            await navigator.clipboard.writeText(shown.map((e) => JSON.stringify(e)).join("\n"));
-            setNote(`Copied ${shown.length} entr${shown.length === 1 ? "y" : "ies"}.`);
-        } catch {
-            setNote("Clipboard blocked — the file path is shown above.");
-        }
-    };
-
-    return (
-        <>
-        {header}
-        <div style={{ display: "flex", flexWrap: "wrap", gap: "0.4rem", marginBottom: "0.6rem" }}>
-        <button type="button" style={buttonStyle} onClick={load}>Refresh</button>
-        <button type="button" style={buttonStyle} onClick={() => setOnlyProblems((v) => !v)}>
-        {onlyProblems ? "Showing problems" : "Showing everything"}
-        </button>
-        <button type="button" style={buttonStyle} onClick={copyAll}>Copy for a bug report</button>
-        </div>
-        {file && <div style={{ ...labelStyle, wordBreak: "break-all", marginBottom: "0.5rem" }}>{file}</div>}
-        {note && <div style={{ ...labelStyle, marginBottom: "0.5rem" }}>{note}</div>}
-        {shown.length === 0 && <div style={labelStyle}>Nothing logged yet.</div>}
-        {shown.map((entry, index) => (
-            <div key={index} style={{ borderBottom: "1px solid rgba(255,255,255,0.08)", padding: "0.4rem 0" }}>
-            <div
-            onClick={() => setExpanded(expanded === index ? null : index)}
-            style={{ cursor: entry.data ? "pointer" : "default", display: "flex", gap: "0.5rem", fontSize: "0.78rem" }}
-            >
-            <span style={{ color: "rgba(255,255,255,0.4)", whiteSpace: "nowrap" }}>{String(entry.at || "").slice(11, 19)}</span>
-            <span style={{ color: LEVEL_TONE[entry.level] || LEVEL_TONE.info, fontWeight: 700, whiteSpace: "nowrap" }}>{entry.source}</span>
-            <span style={{ color: "rgba(255,255,255,0.55)", whiteSpace: "nowrap" }}>{entry.event}</span>
-            <span style={{ color: "#fff", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{entry.message}</span>
-            {entry.data && <span style={{ color: "rgba(255,255,255,0.35)" }}>{expanded === index ? "▾" : "▸"}</span>}
-            </div>
-            {expanded === index && entry.data && (
-                <pre style={{
-                    background: "rgba(0,0,0,0.35)", borderRadius: 6, color: "rgba(255,255,255,0.8)",
-                    fontSize: "0.72rem", margin: "0.4rem 0 0", maxHeight: "18rem", overflow: "auto", padding: "0.5rem",
-                    whiteSpace: "pre-wrap", wordBreak: "break-word",
-                }}>{typeof entry.data === "string" ? entry.data : JSON.stringify(entry.data, null, 2)}</pre>
-            )}
-            </div>
-        ))}
-        </>
-    );
-};
-
 const ToolView = ({ tool, header, busy, status, game, polities, refresh, runBusy, beginClickMode, endClickMode, setStatus, navigateTool }) => {
     const meta = TOOLS.find((entry) => entry.id === tool);
     const [text, setText] = useState("");
     const [gmMode, setGmMode] = useState("world-intervention");
     const [gmPreview, setGmPreview] = useState(null);
     const [gmApplyResult, setGmApplyResult] = useState(null);
+    const [gmExpandedSections, setGmExpandedSections] = useState({});
     const [target, setTarget] = useState("");
     const [fields, setFields] = useState({});
     const [items, setItems] = useState(null);
@@ -2038,10 +2193,66 @@ const ToolView = ({ tool, header, busy, status, game, polities, refresh, runBusy
         return data;
     };
 
+    // History Document: the living document, the ledger of passes behind it, and
+    // where the next pass stands. Every read is forced: this tool exists to show
+    // what the save says right now.
+    const loadHistoryDocument = async () => {
+        const [world, events, chats, actions] = await Promise.all([
+            readWorldState({ force: true }),
+            readEventsState({ force: true }),
+            readJson(JSON_URLS.chat, { defaultValue: [], force: true }).catch(() => []),
+            readJson(JSON_URLS.actions, { defaultValue: [], force: true }).catch(() => []),
+        ]);
+        const bundle = { world, events, chats, actions, game };
+        const data = {
+            document: world?.historyDocument ?? null,
+            passes: Array.isArray(world?.consolidatedHistory) ? world.consolidatedHistory : [],
+            status: { ...describeHistoryConsolidation(bundle), canFoldNow: planHistoryConsolidation(bundle, { force: true }).due },
+            totalEvents: Array.isArray(events) ? events.length : 0,
+        };
+        setItems(data);
+        setFields({ document: data.document?.text ?? "" });
+        return data;
+    };
+
     const saveScenarioCities = async (features) => {
+        const cityNames = (list) => new Set((Array.isArray(list) ? list : [])
+            .map((feature) => String(feature?.properties?.name ?? "").trim()).filter(Boolean));
+        const before = cityNames((await readJson(JSON_URLS.citiesGeojson, { defaultValue: EMPTY_FEATURES, force: true }).catch(() => EMPTY_FEATURES))?.features);
         await writeJson(JSON_URLS.citiesGeojson, { type: "FeatureCollection", features }, { pretty: true });
         notifyCitiesUpdated();
+        const after = cityNames(features);
+        const added = [...after].filter((name) => !before.has(name));
+        const removed = [...before].filter((name) => !after.has(name));
+        const listed = (names) => `${names.slice(0, 4).join(", ")}${names.length > 4 ? ` and ${names.length - 4} more` : ""}`;
+        const parts = [
+            added.length ? `added the cit${added.length === 1 ? "y" : "ies"} ${listed(added)}` : "",
+            removed.length ? `removed the cit${removed.length === 1 ? "y" : "ies"} ${listed(removed)}` : "",
+        ].filter(Boolean);
+        await noteGmChange("feature", parts.length
+            ? `${capitalize(parts.join("; "))} on the map by hand.`
+            : "Edited the details of the map's cities by hand.");
         return loadMapFeatureData();
+    };
+
+    // One line for the next time skip, from the operations themselves.
+    const describeAdminMarkerOps = (markerOps) => {
+        const ops = Array.isArray(markerOps) ? markerOps : [];
+        const named = (op) => String(op?.name ?? op?.markerId ?? "a feature").trim();
+        const group = (verb, list) => {
+            if (!list.length) return "";
+            const names = list.map(named);
+            return `${verb} ${names.slice(0, 4).join(", ")}${names.length > 4 ? ` and ${names.length - 4} more` : ""}`;
+        };
+        const byOp = (kind) => ops.filter((op) => String(op?.op ?? "").toLowerCase() === kind);
+        const parts = [
+            group("placed", byOp("add").concat(byOp("create"))),
+            group("changed", byOp("update")),
+            group("removed", byOp("remove").concat(byOp("delete"))),
+        ].filter(Boolean);
+        return parts.length
+            ? `${capitalize(parts.join("; "))} on the map by hand.`
+            : "Edited the map's features by hand.";
     };
 
     const applyAdminMarkerOps = async (markerOps) => {
@@ -2063,6 +2274,7 @@ const ToolView = ({ tool, header, busy, status, game, polities, refresh, runBusy
             }],
         });
         await writeWorldState(result.world);
+        await noteGmChange("feature", describeAdminMarkerOps(markerOps));
         await refresh();
         return loadMapFeatureData();
     };
@@ -2073,6 +2285,7 @@ const ToolView = ({ tool, header, busy, status, game, polities, refresh, runBusy
         setEditingId(null);
         setGmPreview(null);
         setGmApplyResult(null);
+        setGmExpandedSections({});
         setSearch("");
         setFields({});
         setTarget("");
@@ -2083,6 +2296,9 @@ const ToolView = ({ tool, header, busy, status, game, polities, refresh, runBusy
         }
         if (tool === "edit-feature" || tool === "add-feature" || tool === "clear-features") {
             loadMapFeatureData().catch(() => setItems({ customCities: false, markers: [], cities: [] }));
+        }
+        if (tool === "history-document") {
+            loadHistoryDocument().catch((error) => setItems({ document: null, passes: [], status: { text: `Could not read the campaign: ${error.message}`, canFoldNow: false }, totalEvents: 0 }));
         }
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [tool]);
@@ -2098,8 +2314,17 @@ const ToolView = ({ tool, header, busy, status, game, polities, refresh, runBusy
 
     // ----- individual tools -----
 
-    if (tool === "logs") {
-        return <LogsPanel header={header(meta.title, meta.subtitle)} />;
+    if (tool === "reminders") {
+        return (
+            <RemindersView
+                meta={meta}
+                header={header}
+                busy={busy}
+                status={status}
+                game={game}
+                runBusy={runBusy}
+            />
+        );
     }
 
     if (tool === "events") {
@@ -2193,6 +2418,36 @@ const ToolView = ({ tool, header, busy, status, game, polities, refresh, runBusy
             </div>
         );
 
+        const GM_COLLAPSED_OPERATION_LIMIT = 4;
+        const visibleOperationRows = (sectionId, entries) => {
+            const expanded = Boolean(gmExpandedSections[sectionId]);
+            return expanded ? entries : entries.slice(0, GM_COLLAPSED_OPERATION_LIMIT);
+        };
+        const operationExpander = (sectionId, count) => {
+            if (count <= GM_COLLAPSED_OPERATION_LIMIT) return null;
+            const expanded = Boolean(gmExpandedSections[sectionId]);
+            const hidden = Math.max(0, count - GM_COLLAPSED_OPERATION_LIMIT);
+            return (
+                <button
+                    type="button"
+                    onClick={() => setGmExpandedSections((current) => ({ ...current, [sectionId]: !expanded }))}
+                    style={{
+                        background: "transparent",
+                        border: 0,
+                        color: "rgba(147,197,253,0.82)",
+                        cursor: "pointer",
+                        fontSize: "0.63rem",
+                        fontWeight: 650,
+                        marginTop: "0.28rem",
+                        padding: "0.15rem 0",
+                        textAlign: "left",
+                    }}
+                >
+                    {expanded ? "Show fewer" : `… ${hidden} more · click to show all`}
+                </button>
+            );
+        };
+
         const modeOptions = [
             {
                 id: "direct",
@@ -2253,7 +2508,7 @@ const ToolView = ({ tool, header, busy, status, game, polities, refresh, runBusy
                                 key={option.id}
                                 type="button"
                                 disabled={busy}
-                                onClick={() => { setGmMode(option.id); setGmPreview(null); setGmApplyResult(null); }}
+                                onClick={() => { setGmMode(option.id); setGmPreview(null); setGmApplyResult(null); setGmExpandedSections({}); }}
                                 style={{
                                     ...buttonStyle,
                                     alignItems: "flex-start",
@@ -2277,7 +2532,7 @@ const ToolView = ({ tool, header, busy, status, game, polities, refresh, runBusy
                 <label style={labelStyle}>GM request</label>
                 <textarea
                     value={text}
-                    onChange={(event) => { setText(event.target.value); setGmPreview(null); setGmApplyResult(null); }}
+                    onChange={(event) => { setText(event.target.value); setGmPreview(null); setGmApplyResult(null); setGmExpandedSections({}); }}
                     placeholder={gmMode === "direct"
                         ? 'Example: "Germany should have a population of 72 million and GDP of €500 billion. Do not add a timeline event."'
                         : gmMode === "exact-event"
@@ -2293,6 +2548,7 @@ const ToolView = ({ tool, header, busy, status, game, polities, refresh, runBusy
                         const result = await previewGameMasterCommand(text.trim(), { mode: gmMode });
                         setGmPreview(result);
                         setGmApplyResult(null);
+                        setGmExpandedSections({});
                         return result?.summary
                             ? `Preview ready — ${result.summary}`
                             : "GM transaction preview ready. Nothing has been applied.";
@@ -2392,7 +2648,7 @@ const ToolView = ({ tool, header, busy, status, game, polities, refresh, runBusy
                                         <div style={{ ...exactRowStyle, color: "rgba(134,239,172,0.72)" }}>
                                             NONE · legal sovereignty remains with the current sovereigns.
                                         </div>
-                                    ) : transferOps.map((entry, index) => (
+                                    ) : visibleOperationRows("territory-sovereignty", transferOps).map((entry, index) => (
                                         <div key={`transfer-${entry._eventIndex}-${entry._opIndex}-${index}`} style={exactRowStyle}>
                                             <strong style={{ color: "rgba(255,255,255,0.88)" }}>{entry.regionName || entry.regionId || "Unknown region"}</strong>
                                             {` · ${entry.fromCode || "unclaimed"} → ${entry.toCode || "unclaimed"}${entry.wholeCountry ? " · whole country" : ""}`}
@@ -2400,11 +2656,12 @@ const ToolView = ({ tool, header, busy, status, game, polities, refresh, runBusy
                                             {entry.note ? <div style={{ color: "rgba(255,255,255,0.42)", marginTop: "0.14rem" }}>{entry.note}</div> : null}
                                         </div>
                                     ))}
+                                    {operationExpander("territory-sovereignty", transferOps.length)}
 
                                     {subsectionTitle("Territory · de-facto control / contest", controlOps.length, "does not change legal sovereignty")}
                                     {controlOps.length === 0 ? (
                                         <div style={exactRowStyle}>NONE</div>
-                                    ) : controlOps.map((entry, index) => {
+                                    ) : visibleOperationRows("territory-control", controlOps).map((entry, index) => {
                                         const region = entry.regionName || entry.regionId || "Unknown region";
                                         let detail = entry.op || "operation";
                                         if (entry.op === "contest") detail = `CONTEST · current controller ${entry.fromCode || "unknown"} · challenger ${entry.actorCode || "unknown"}`;
@@ -2418,11 +2675,12 @@ const ToolView = ({ tool, header, busy, status, game, polities, refresh, runBusy
                                             </div>
                                         );
                                     })}
+                                    {operationExpander("territory-control", controlOps.length)}
 
                                     {subsectionTitle("Territory · claims", claimOps.length, "does not move the border")}
                                     {claimOps.length === 0 ? (
                                         <div style={exactRowStyle}>NONE</div>
-                                    ) : claimOps.map((entry, index) => (
+                                    ) : visibleOperationRows("territory-claims", claimOps).map((entry, index) => (
                                         <div key={`claim-${entry._eventIndex}-${entry._opIndex}-${index}`} style={exactRowStyle}>
                                             <strong style={{ color: "rgba(255,255,255,0.88)" }}>{entry.regionName || entry.regionId || "Unknown region"}</strong>
                                             {` · ${entry.drop ? "CLAIM WITHDRAWN" : "CLAIMED"} by ${entry.claimantCode || "unknown"}`}
@@ -2430,6 +2688,7 @@ const ToolView = ({ tool, header, busy, status, game, polities, refresh, runBusy
                                             {entry.note ? <div style={{ color: "rgba(255,255,255,0.42)", marginTop: "0.14rem" }}>{entry.note}</div> : null}
                                         </div>
                                     ))}
+                                    {operationExpander("territory-claims", claimOps.length)}
                                 </div>
                             )}
 
@@ -2604,7 +2863,17 @@ const ToolView = ({ tool, header, busy, status, game, polities, refresh, runBusy
                             onClick={() => runBusy(async () => {
                                 const result = await applyGameMasterPreview(gmPreview);
                                 setGmApplyResult(result);
-                                await refresh();
+                                // world.json writes already emit the canonical update consumed by
+                                // the map. Do not make the first post-Apply frames compete with a
+                                // heavyweight admin-panel refresh; refresh this panel when idle.
+                                const refreshLater = () => Promise.resolve(refresh()).catch((error) => {
+                                    console.warn("[GM] deferred admin refresh failed:", error);
+                                });
+                                if (typeof window !== "undefined" && typeof window.requestIdleCallback === "function") {
+                                    window.requestIdleCallback(refreshLater, { timeout: 1200 });
+                                } else {
+                                    setTimeout(refreshLater, 0);
+                                }
                                 return result?.summary
                                     ? `Applied — ${result.summary}`
                                     : `Applied GM transaction ${result?.transactionId || ""}.`;
@@ -2612,9 +2881,13 @@ const ToolView = ({ tool, header, busy, status, game, polities, refresh, runBusy
                             style={{
                                 ...primaryButtonStyle,
                                 cursor: busy || gmApplied ? "not-allowed" : "pointer",
+                                bottom: "0.45rem",
+                                boxShadow: "0 -10px 24px rgba(8,12,20,0.88)",
                                 marginTop: "0.75rem",
                                 opacity: busy || gmApplied ? 0.52 : 1,
+                                position: "sticky",
                                 width: "100%",
+                                zIndex: 4,
                             }}
                         >
                             {busy ? "Applying canonical transaction…" : gmApplied ? "Applied ✓" : "Apply Transaction"}
@@ -2627,6 +2900,151 @@ const ToolView = ({ tool, header, busy, status, game, polities, refresh, runBusy
                     </div>
                 )}
                 {statusLine}
+            </div>
+            </>
+        );
+    }
+
+    if (tool === "history-document") {
+        const data = items;
+        const doc = data?.document ?? null;
+        const passes = data?.passes ?? [];
+        const savedText = doc?.text ?? "";
+        const draft = typeof fields.document === "string" ? fields.document : savedText;
+        const dirty = draft !== savedText;
+        const draftWords = countWords(draft);
+        const confirmingReset = editingId === "reset-history";
+        // Reads the save again before writing, so a hand edit never clobbers a
+        // document a turn rewrote while the panel was open.
+        const saveDocument = async () => {
+            const world = await readWorldState({ force: true });
+            const current = world?.historyDocument ?? null;
+            const text = draft.trim();
+            const next = text
+                ? {
+                    text,
+                    revision: (current?.revision ?? 0) + 1,
+                    updatedAt: new Date().toISOString(),
+                    source: "manual",
+                    throughDate: current?.throughDate ?? "",
+                    throughEventId: current?.throughEventId ?? "",
+                    throughRound: current?.throughRound ?? 0,
+                }
+                : null;
+            await writeWorldState({ ...world, historyDocument: next });
+            if ((current?.text ?? "").trim() !== text) {
+                await noteGmChange("history", next
+                    ? "Rewrote the history document by hand; it is the account of the past to go by."
+                    : "Cleared the history document by hand.");
+            }
+            await loadHistoryDocument();
+            return next
+                ? `History document saved (revision ${next.revision}, ${countWords(text)} words). The AI reads it from its next call.`
+                : "History document cleared. The AI is shown the pass summaries below until the next pass writes a new document.";
+        };
+        const resetCompression = async () => {
+            const world = await readWorldState({ force: true });
+            await writeWorldState({ ...world, historyDocument: null, consolidatedHistory: [] });
+            setEditingId(null);
+            await loadHistoryDocument();
+            return "Compression reset: the document and its pass ledger are gone. Every event is still in the timeline, and the AI is shown all of them in full until the next pass.";
+        };
+        return (
+            <>
+            {header(meta.title, meta.subtitle)}
+            <div style={{ display: "flex", flexDirection: "column", minHeight: 0 }}>
+            <div style={{ color: "rgba(255,255,255,0.55)", fontSize: "0.76rem", marginBottom: "0.5rem" }}>
+            Every event stays in the timeline in full. When enough have piled up, a pass folds the older ones into this document — the first pass writes it, every later one rewrites it with the new period added and unimportant older material condensed to stay near {HISTORY_CONSOLIDATION.documentWordBudget} words — and the AI is shown the document in their place, plus the newest {HISTORY_CONSOLIDATION.retainEvents} events one by one.
+            </div>
+            {data === null && (
+                <div style={{ color: "rgba(255,255,255,0.5)", fontSize: "0.76rem" }}>Reading the campaign…</div>
+            )}
+            {data !== null && (
+                <div style={{ ...editorFieldStyle, color: "rgba(255,255,255,0.72)", fontSize: "0.74rem", lineHeight: 1.45, marginBottom: "0.5rem" }}>
+                <div>{data.totalEvents} events in the timeline. {data.status.text}</div>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: "0.3rem", marginTop: "0.45rem" }}>
+                <button
+                type="button"
+                disabled={busy || !data.status.canFoldNow}
+                title={data.status.canFoldNow ? "Runs the AI consolidator on the older events now" : "Only the retained tail is waiting; there is nothing older to fold"}
+                style={{ ...primaryButtonStyle, opacity: busy || !data.status.canFoldNow ? 0.55 : 1, padding: "0.3rem 0.6rem" }}
+                onClick={() => runBusy(async () => {
+                    const result = await consolidateHistoryNow();
+                    await loadHistoryDocument();
+                    return result.consolidated
+                        ? `Folded ${result.events} event${result.events === 1 ? "" : "s"} and ${result.chats} chat${result.chats === 1 ? "" : "s"}; the document is now revision ${result.documentRevision}, ${result.documentWords} words. The newest ${result.retained} events stay in full.`
+                        : "Nothing was folded: only the retained tail is waiting, or the consolidator came back empty.";
+                })}
+                >
+                Fold the older events now
+                </button>
+                {confirmingReset ? (
+                    <>
+                    <button type="button" disabled={busy} style={{ ...primaryButtonStyle, padding: "0.3rem 0.6rem" }} onClick={() => runBusy(resetCompression)}>Confirm reset</button>
+                    <button type="button" disabled={busy} style={{ ...buttonStyle, padding: "0.3rem 0.6rem" }} onClick={() => setEditingId(null)}>Keep</button>
+                    </>
+                ) : (
+                    <button
+                    type="button"
+                    disabled={busy || (!doc && passes.length === 0)}
+                    title="Deletes the document and the pass ledger; every event is shown to the AI in full again until the next pass"
+                    style={{ ...buttonStyle, opacity: busy || (!doc && passes.length === 0) ? 0.55 : 1, padding: "0.3rem 0.6rem" }}
+                    onClick={() => setEditingId("reset-history")}
+                    >
+                    Reset compression
+                    </button>
+                )}
+                </div>
+                </div>
+            )}
+            {data !== null && (
+                <>
+                <div style={editorSectionLabelStyle}>The document{doc || draft ? ` · ${draftWords} words${dirty ? " · unsaved changes" : ""}` : ""}</div>
+                <textarea
+                value={draft}
+                onChange={(event) => setFields({ document: event.target.value })}
+                rows={16}
+                placeholder="No history document yet. The first pass writes it — or type one here and save it."
+                style={{ ...inputStyle, fontFamily: "inherit", lineHeight: 1.45, resize: "vertical", width: "100%" }}
+                />
+                <div style={{ display: "flex", gap: "0.3rem", marginTop: "0.4rem" }}>
+                <button
+                type="button"
+                disabled={busy || !dirty}
+                style={{ ...primaryButtonStyle, opacity: busy || !dirty ? 0.55 : 1, padding: "0.3rem 0.6rem" }}
+                onClick={() => runBusy(saveDocument)}
+                >
+                Save document
+                </button>
+                <button type="button" disabled={busy || !dirty} style={{ ...buttonStyle, opacity: busy || !dirty ? 0.55 : 1, padding: "0.3rem 0.6rem" }} onClick={() => setFields({ document: savedText })}>Revert</button>
+                </div>
+                </>
+            )}
+            {passes.length > 0 && (
+                <details style={{ marginTop: "0.6rem" }}>
+                <summary style={{ cursor: "pointer", color: "rgba(255,255,255,0.6)", fontSize: "0.74rem" }}>{passes.length} pass{passes.length === 1 ? "" : "es"} so far — what each one folded</summary>
+                <div style={{ display: "flex", flexDirection: "column", gap: "0.4rem", marginTop: "0.4rem", maxHeight: "18rem", overflowY: "auto" }}>
+                {passes.map((entry, index) => {
+                    const summary = String(entry?.summary ?? "");
+                    const metaLine = [
+                        `Pass ${index + 1}`,
+                        entry?.throughRound ? `through round ${entry.throughRound}` : "",
+                        entry?.throughDate ? `to ${entry.throughDate}` : "",
+                        entry?.chatIds?.length ? `${entry.chatIds.length} chat${entry.chatIds.length === 1 ? "" : "s"}` : "",
+                        entry?.actionIds?.length ? `${entry.actionIds.length} order${entry.actionIds.length === 1 ? "" : "s"}` : "",
+                        entry?.source === "fallback" ? "written without the AI" : "",
+                    ].filter(Boolean).join(" · ");
+                    return (
+                        <div key={`${entry?.throughEventId || "pass"}-${index}`} style={{ background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.08)", borderRadius: 8, padding: "0.5rem 0.6rem" }}>
+                        <div style={{ color: "rgba(255,255,255,0.45)", fontSize: "0.68rem", marginBottom: "0.3rem" }}>{metaLine}</div>
+                        <div style={{ color: "rgba(255,255,255,0.78)", fontSize: "0.74rem", lineHeight: 1.45, maxHeight: "8rem", overflowY: "auto", whiteSpace: "pre-wrap" }}>{summary}</div>
+                        </div>
+                    );
+                })}
+                </div>
+                </details>
+            )}
+            {statusLine}
             </div>
             </>
         );
@@ -2681,6 +3099,10 @@ const ToolView = ({ tool, header, busy, status, game, polities, refresh, runBusy
                             // Drop this restore point and every newer one — those turns no longer happened.
                             const remaining = snapshots.slice(index + 1);
                             await writeJson(JSON_URLS.snapshots, remaining);
+                            // Noted in the restored world, so the next skip hears it — along
+                            // with any change made in this round before the undone turn,
+                            // which it is now hearing for the first time again.
+                            await noteGmChange("rollback", `Rolled the world back to the start of round ${snap.round}${dateLabel ? ` (${dateLabel})` : ""}: the ${index === 0 ? "turn" : `${index + 1} turns`} after it never happened.`);
                             setItems(remaining);
                             setEditingId(null);
                             await refresh();
@@ -2721,6 +3143,7 @@ const ToolView = ({ tool, header, busy, status, game, polities, refresh, runBusy
             onClick={() => runBusy(async () => {
                 const current = await readGameData({ force: true });
                 await writeGameData({ ...current, country: target });
+                await noteGmChange("polity", `The player now leads ${nameOf(target)}${current?.country ? ` instead of ${nameOf(current.country)}` : ""}.`);
                 await refresh();
                 return `You now lead ${nameOf(target)}.`;
             })}
@@ -2929,11 +3352,20 @@ const ToolView = ({ tool, header, busy, status, game, polities, refresh, runBusy
                                     if (code === source) overrides[regionId] = owner;
                                 }
                                 await writeWorldState({ ...world, regionOwnershipOverrides: overrides });
+                                await noteGmChange("territory", `Annexed the whole of ${nameOf(source)} into ${nameOf(owner)} by hand (${count} regions).`);
                                 setStatus(`${nameOf(source)} annexed into ${nameOf(owner)} (${count} regions). The map updates within a few seconds.`);
                             } else {
                                 if (!props.GID_1) return;
+                                const previous = overrides[String(props.GID_1)];
                                 overrides[String(props.GID_1)] = owner;
                                 await writeWorldState({ ...world, regionOwnershipOverrides: overrides });
+                                if (previous !== owner) {
+                                    await noteGmChange("territory", "", {
+                                        group: `regions→${owner}`,
+                                        template: `Moved {items} to ${nameOf(owner)} by hand.`,
+                                        item: String(props.NAME_1 || props.GID_1),
+                                    });
+                                }
                                 setStatus(`${props.NAME_1 || props.GID_1} → ${nameOf(owner)}. Keep clicking, or press Done.`);
                             }
                         } catch (error) {
@@ -2979,6 +3411,9 @@ const ToolView = ({ tool, header, busy, status, game, polities, refresh, runBusy
             if (rgb) {
                 const colors = await readJson(JSON_URLS.colors, { defaultValue: {}, force: true });
                 await writeJson(JSON_URLS.colors, { ...colors, [code]: rgb }, { pretty: true });
+            }
+            if (adding && !world.polityOverrides?.[code]) {
+                await noteGmChange("polity", `Created the polity ${nextOverride.name} by hand; it holds no land until it is given some.`);
             }
             await refresh();
             return adding
@@ -3132,6 +3567,17 @@ const ToolView = ({ tool, header, busy, status, game, polities, refresh, runBusy
                 }],
             });
             await writeWorldState(result.world);
+            const region = String(fields.name || regionId || "a region");
+            const was = (code) => (code ? ` (was ${nameOf(code)})` : "");
+            const edits = [
+                ...(impacts.regionControlOps ?? []).filter((op) => op.op === "control")
+                    .map((op) => `${region} is now held by ${nameOf(op.toCode)}${was(op.fromCode)}`),
+                ...(impacts.regionTransfers ?? [])
+                    .map((op) => `${region} now belongs legally to ${nameOf(op.toCode)}${was(op.fromCode)}`),
+                ...(impacts.regionClaims ?? [])
+                    .map((op) => `${nameOf(op.claimantCode)} ${op.drop ? "no longer claims" : "now claims"} ${region}`),
+            ];
+            if (edits.length) await noteGmChange("territory", `${edits.join("; ")} — set by hand.`);
             await refresh();
             await readRegionState({ id: regionId, fallback: fields });
             return message;
@@ -3370,8 +3816,12 @@ const ToolView = ({ tool, header, busy, status, game, polities, refresh, runBusy
                                             String(entry?.properties?.id ?? entry?.properties?.GID_1 ?? entry?.id ?? "") === regionId
                                         );
                                         if (!feature) throw new Error("The editable region geometry disappeared; pick the region again.");
+                                        const formerName = String(feature.properties?.name ?? "").trim();
                                         feature.properties = { ...(feature.properties ?? {}), name: String(fields.name).trim() };
                                         await writeJson(JSON_URLS.regionsGeojson, geojson, { pretty: true });
+                                        if (formerName && formerName !== String(fields.name).trim()) {
+                                            await noteGmChange("territory", `Renamed the region ${formerName} to ${String(fields.name).trim()} by hand; it is the same place.`);
+                                        }
                                         await readRegionState({ id: regionId, fallback: fields });
                                         return `Region name → ${String(fields.name).trim()}.`;
                                     })}
@@ -4105,6 +4555,7 @@ const ToolView = ({ tool, header, busy, status, game, polities, refresh, runBusy
                         onClick={() => runBusy(async () => {
                             const world = await readWorldState({ force: true });
                             await writeWorldState({ ...world, customCities: false });
+                            await noteGmChange("feature", "Replaced the scenario's own cities with the standard world city list, by hand.");
                             await refresh();
                             await loadMapFeatureData();
                             return "Scenario city layer disabled; stock world cities restored.";

@@ -1,3 +1,6 @@
+import { astronomicalYear, compareGameDates, isGameDate, parseGameDate } from "./gameDates.js";
+import { DEFAULT_STAT_INDEX_KEYS, MAX_STAT_INDICES, STAT_INDEX_KEY_PATTERN } from "./statIndexDefinitions.js";
+
 /*! Open Historia — native persistent country statistics and economic aggregation. */
 
 export const COUNTRY_STATS_SCHEMA_VERSION = 1;
@@ -13,16 +16,14 @@ export const COUNTRY_STATS_COMPONENT_GROUPS = Object.freeze([
   "integrated",
   "overseas/dependent",
 ]);
+export const COUNTRY_STATS_TERRITORIAL_SCOPES = Object.freeze([
+  "mapped",
+  "nonterritorial",
+]);
 
 const COMPONENT_GROUP_SET = new Set(COUNTRY_STATS_COMPONENT_GROUPS);
-const INDEX_KEYS = Object.freeze([
-  "sovereignty",
-  "foodAutonomy",
-  "energyAutonomy",
-  "economicIndependence",
-  "internalSecurity",
-  "internationalReputation",
-]);
+const TERRITORIAL_SCOPE_SET = new Set(COUNTRY_STATS_TERRITORIAL_SCOPES);
+const INDEX_KEYS = DEFAULT_STAT_INDEX_KEYS;
 const ECONOMY_NUMERIC_KEYS = Object.freeze([
   "gdp",
   "gdpPerCapita",
@@ -38,6 +39,21 @@ const ECONOMY_NUMERIC_KEYS = Object.freeze([
 const clean = (value) => String(value ?? "").trim();
 const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
 const finite = (value) => Number.isFinite(Number(value));
+
+const MAX_CUSTOM_STATS_VALUES = 60;
+export const normalizeCustomCountryStats = (value) => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const out = {};
+  for (const [rawKey, rawValue] of Object.entries(value)) {
+    const key = clean(rawKey);
+    if (!/^[A-Za-z][A-Za-z0-9]{0,39}$/.test(key)) continue;
+    const number = parseStatNumber(rawValue);
+    if (!Number.isFinite(number)) continue;
+    out[key] = Math.max(-1e18, Math.min(1e18, number));
+    if (Object.keys(out).length >= MAX_CUSTOM_STATS_VALUES) break;
+  }
+  return Object.keys(out).length ? out : undefined;
+};
 
 export const countryStatsTrackingIntervalLabel = (months) => {
   const numeric = Math.max(0, Math.trunc(Number(months) || 0));
@@ -83,7 +99,7 @@ export const normalizeCountryStatsTracking = (
     for (const [polity, date] of Object.entries(input.lastAutoRefreshByPolity)) {
       const key = clean(polity);
       const when = clean(date);
-      if (!key || !/^\d{4}-\d{2}-\d{2}$/.test(when)) continue;
+      if (!key || !isGameDate(when)) continue;
       if (!trackedKeys.has(key.toLocaleLowerCase())) continue;
       lastAutoRefreshByPolity[key] = when;
     }
@@ -101,26 +117,18 @@ export const normalizeCountryStatsTracking = (
     trackedPolities,
     lastAutoRefreshByPolity,
     pendingBaselinePolities,
-    lastBatchDate: /^\d{4}-\d{2}-\d{2}$/.test(clean(input.lastBatchDate))
+    lastBatchDate: isGameDate(clean(input.lastBatchDate))
       ? clean(input.lastBatchDate)
       : "",
   };
 };
 
 export const countryStatsTrackingMonthsElapsed = (fromDate, toDate) => {
-  const parse = (value) => {
-    const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(clean(value));
-    if (!match) return null;
-    const year = Number(match[1]);
-    const month = Number(match[2]);
-    const day = Number(match[3]);
-    if (year < 1 || month < 1 || month > 12 || day < 1 || day > 31) return null;
-    return { year, month, day };
-  };
-  const from = parse(fromDate);
-  const to = parse(toDate);
+  const from = parseGameDate(fromDate);
+  const to = parseGameDate(toDate);
   if (!from || !to) return 0;
-  let months = (to.year - from.year) * 12 + (to.month - from.month);
+  // Astronomical years, so a span across 1 BC / AD 1 has no phantom year.
+  let months = (astronomicalYear(to.year) - astronomicalYear(from.year)) * 12 + (to.month - from.month);
   if (to.day < from.day) months -= 1;
   return Math.max(0, months);
 };
@@ -246,14 +254,34 @@ export const aggregateTerritorialEconomy = (componentsInput) => {
   };
 };
 
-const normalizeIndices = (value) => {
+export const normalizeCountryStatIndices = (value, { allowedKeys = INDEX_KEYS } = {}) => {
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const allowed = Array.isArray(allowedKeys)
+    ? new Set(allowedKeys.map((key) => clean(key)).filter((key) => STAT_INDEX_KEY_PATTERN.test(key)))
+    : null;
   const out = {};
-  for (const key of INDEX_KEYS) {
-    const normalized = normalizePercent(value[key]);
+  for (const [key, raw] of Object.entries(value)) {
+    if (Object.keys(out).length >= MAX_STAT_INDICES) break;
+    if (!STAT_INDEX_KEY_PATTERN.test(key) || (allowed && !allowed.has(key))) continue;
+    const normalized = normalizePercent(raw);
     if (normalized != null) out[key] = Math.round(normalized);
   }
   return Object.keys(out).length ? out : undefined;
+};
+
+const normalizeIndexKeys = (value) => {
+  if (!Array.isArray(value)) return undefined;
+  const out = [];
+  const seen = new Set();
+  for (const raw of value) {
+    const key = clean(raw);
+    const token = key.toLowerCase();
+    if (!STAT_INDEX_KEY_PATTERN.test(key) || seen.has(token)) continue;
+    seen.add(token);
+    out.push(key);
+    if (out.length >= MAX_STAT_INDICES) break;
+  }
+  return out.length ? out : undefined;
 };
 
 const normalizeBreakdown = (value) => {
@@ -317,6 +345,7 @@ const normalizePopulation = (value) => {
 
 
 const MAX_ACCOUNTED_ECONOMIC_EVENTS = 64;
+const MAX_SEMANTIC_SPLIT_COMPONENTS = 64;
 
 export const normalizeCountryStatContinuity = (value) => {
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
@@ -346,6 +375,23 @@ export const normalizeCountryStatContinuity = (value) => {
 
   if (accountedEventIds.length) out.accountedEventIds = accountedEventIds;
 
+  // Components whose share of their macro bucket the model set in a per-component
+  // split (see decodeTerritorialComponentSplit), with how many map regions the
+  // component had then. Anything not listed still holds a native weight estimate,
+  // and a listed one whose holding has since grown or shrunk is a different slice:
+  // both are asked for a real split at their next assessment. Kept when empty: an
+  // empty list replaces an older one when sheets are merged.
+  if (Array.isArray(value.semanticSplitComponents)) {
+    const byGeography = new Map();
+    for (const entry of value.semanticSplitComponents) {
+      const geography = clean(entry?.geography);
+      const regions = Number(entry?.regions);
+      if (!geography || !Number.isInteger(regions) || regions < 0) continue;
+      if (!byGeography.has(componentKey(geography))) byGeography.set(componentKey(geography), { geography, regions });
+    }
+    out.semanticSplitComponents = [...byGeography.values()].slice(0, MAX_SEMANTIC_SPLIT_COMPONENTS);
+  }
+
   return Object.keys(out).length ? out : undefined;
 };
 
@@ -374,7 +420,7 @@ const copyTextField = (source, target, key) => {
   if (text) target[key] = text;
 };
 
-export const normalizeCountryStatSheet = (value) => {
+export const normalizeCountryStatSheet = (value, { indexKeys: expectedIndexKeys } = {}) => {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
 
   const out = {};
@@ -385,8 +431,13 @@ export const normalizeCountryStatSheet = (value) => {
   const stability = normalizePercent(value.stability);
   if (stability != null) out.stability = Math.round(stability);
 
-  const indices = normalizeIndices(value.indices);
+  const customStats = normalizeCustomCountryStats(value.customStats);
+  if (customStats) out.customStats = customStats;
+
+  const indexKeys = normalizeIndexKeys(value.indexKeys);
+  const indices = normalizeCountryStatIndices(value.indices, { allowedKeys: normalizeIndexKeys(expectedIndexKeys) || indexKeys || INDEX_KEYS });
   if (indices) out.indices = indices;
+  if (indexKeys) out.indexKeys = indexKeys;
 
   const economy = normalizeEconomy(value.economy);
   if (economy) out.economy = economy;
@@ -397,8 +448,12 @@ export const normalizeCountryStatSheet = (value) => {
   const breakdown = normalizeBreakdown(value.gdpBreakdown);
   if (breakdown) out.gdpBreakdown = breakdown;
 
+  const territorialScope = clean(value.territorialScope).toLowerCase();
+  if (TERRITORIAL_SCOPE_SET.has(territorialScope)) out.territorialScope = territorialScope;
+
+  const hasExplicitComponents = Array.isArray(value.territorialComponents);
   const components = normalizeTerritorialComponents(value.territorialComponents);
-  if (components.length) out.territorialComponents = components;
+  if (components.length || hasExplicitComponents) out.territorialComponents = components;
 
   const continuity = normalizeCountryStatContinuity(value.continuity);
   if (continuity) out.continuity = continuity;
@@ -406,7 +461,7 @@ export const normalizeCountryStatSheet = (value) => {
   const declaredVersion = Number(value.statsSchemaVersion);
   out.statsSchemaVersion = Number.isInteger(declaredVersion) && declaredVersion > 0
     ? declaredVersion
-    : components.length
+    : components.length || territorialScope === "nonterritorial"
       ? COUNTRY_STATS_SCHEMA_VERSION
       : 0;
 
@@ -417,7 +472,7 @@ export const normalizeCountryStatSheet = (value) => {
   return out;
 };
 
-export const finalizeCountryStatSheet = (value) => {
+export const finalizeCountryStatSheet = (value, { indexKeys: expectedIndexKeys } = {}) => {
   if (!value || typeof value !== "object" || Array.isArray(value)) return value;
 
   // Start with normalized legacy-compatible fields without recursively invoking
@@ -428,18 +483,27 @@ export const finalizeCountryStatSheet = (value) => {
   const stability = normalizePercent(value.stability);
   if (stability != null) out.stability = Math.round(stability);
 
-  const indices = normalizeIndices(value.indices);
+  const customStats = normalizeCustomCountryStats(value.customStats);
+  if (customStats) out.customStats = customStats;
+
+  const indexKeys = normalizeIndexKeys(value.indexKeys);
+  const indices = normalizeCountryStatIndices(value.indices, { allowedKeys: normalizeIndexKeys(expectedIndexKeys) || indexKeys || INDEX_KEYS });
   if (indices) out.indices = indices;
+  if (indexKeys) out.indexKeys = indexKeys;
 
   const breakdown = normalizeBreakdown(value.gdpBreakdown);
   if (breakdown) out.gdpBreakdown = breakdown;
 
+  const territorialScope = clean(value.territorialScope).toLowerCase();
+  if (TERRITORIAL_SCOPE_SET.has(territorialScope)) out.territorialScope = territorialScope;
+
   const economy = normalizeEconomy(value.economy) || {};
+  const hasExplicitComponents = Array.isArray(value.territorialComponents);
   const components = normalizeTerritorialComponents(value.territorialComponents);
   const aggregate = aggregateTerritorialEconomy(components);
   const continuity = normalizeCountryStatContinuity(value.continuity);
 
-  if (components.length) out.territorialComponents = components;
+  if (components.length || hasExplicitComponents) out.territorialComponents = components;
   if (continuity) out.continuity = continuity;
 
   if (aggregate) {
@@ -466,7 +530,11 @@ export const finalizeCountryStatSheet = (value) => {
     if (population) out.population = population;
     if (Object.keys(economy).length) out.economy = economy;
     const declaredVersion = Number(value.statsSchemaVersion);
-    out.statsSchemaVersion = Number.isInteger(declaredVersion) && declaredVersion > 0 ? declaredVersion : 0;
+    out.statsSchemaVersion = Number.isInteger(declaredVersion) && declaredVersion > 0
+      ? declaredVersion
+      : territorialScope === "nonterritorial"
+        ? COUNTRY_STATS_SCHEMA_VERSION
+        : 0;
   }
 
   return out;
@@ -611,6 +679,102 @@ export const calibrateTerritorialComponentPopulations = (componentsInput, calibr
 };
 
 
+// The per-component split: how a macro bucket's population divides between its
+// components, and each component's own group and productivity.
+//
+// Without it, expandTerritorialMacroEstimates shares a bucket out by native
+// weight, which on the built-in maps is region count: Russia holding Crimea gave
+// Crimea 16/341 of the national total, ~3x its real population, and every
+// component inherited the bucket's group and GDP per head — Puerto Rico at US
+// mainland productivity. The ledger exists so a transfer moves a plausible
+// population with the territory, and reassessments reuse each component's prior
+// share, so a bad first split is locked into the campaign.
+//
+// So for polities with few components the model splits the bucket semantically
+// ONCE (bootstrap, hard audit, or a component that has never had a real split),
+// and this validates and normalizes that split deterministically. A bucket whose
+// rows do not validate falls back to the native weights and is not recorded as
+// split, so it is asked again next time.
+//
+// Transport rows: componentId~sharePercent~group~gdpPerCapita, where sharePercent
+// is the component's share of ITS bucket's population.
+export const COMPONENT_SPLIT_SHARE_TOLERANCE = 10;
+
+const parseSharePercent = (value) => {
+  const text = clean(value).replace(/%$/, "").replace(/,/g, "");
+  if (!/^[-+]?\d+(?:\.\d+)?$/.test(text)) return null;
+  const number = Number(text);
+  return Number.isFinite(number) ? number : null;
+};
+
+export const decodeTerritorialComponentSplit = (text, splitBuckets = []) => {
+  const buckets = (Array.isArray(splitBuckets) ? splitBuckets : [])
+    .map((bucket) => ({
+      index: Math.trunc(Number(bucket?.index)),
+      members: (Array.isArray(bucket?.members) ? bucket.members : [])
+        .map((member) => ({ componentId: clean(member?.componentId).toUpperCase(), geography: clean(member?.geography) }))
+        .filter((member) => member.componentId && member.geography),
+    }))
+    .filter((bucket) => Number.isInteger(bucket.index) && bucket.members.length > 0);
+
+  const rows = new Map();
+  const duplicated = new Set();
+  for (const rawLine of clean(text).split(/\r?\n/)) {
+    const parts = rawLine.trim().split("~").map((part) => part.trim());
+    if (parts.length !== 4) continue;
+    const componentId = parts[0].replace(/^\[|\]$/g, "").toUpperCase();
+    if (rows.has(componentId)) duplicated.add(componentId);
+    rows.set(componentId, {
+      share: parseSharePercent(parts[1]),
+      group: parts[2].toLowerCase(),
+      gdpPerCapita: parseStatNumber(parts[3]),
+    });
+  }
+
+  const splits = new Map();
+  const rejected = [];
+  for (const bucket of buckets) {
+    const reject = (reason) => rejected.push({ index: bucket.index, reason });
+    const missing = bucket.members.filter((member) => !rows.has(member.componentId)).map((member) => member.componentId);
+    if (missing.length) {
+      reject(`no row for ${missing.join(", ")}`);
+      continue;
+    }
+    const doubled = bucket.members.filter((member) => duplicated.has(member.componentId)).map((member) => member.componentId);
+    if (doubled.length) {
+      reject(`more than one row for ${doubled.join(", ")}`);
+      continue;
+    }
+    const invalid = bucket.members.find((member) => {
+      const row = rows.get(member.componentId);
+      return row.share === null || row.share < 0
+        || !COMPONENT_GROUP_SET.has(row.group)
+        || !Number.isFinite(row.gdpPerCapita) || !(row.gdpPerCapita > 0);
+    });
+    if (invalid) {
+      reject(`the row for ${invalid.componentId} needs a share of 0 or more, a group of ${COUNTRY_STATS_COMPONENT_GROUPS.join(" | ")}, and a positive gdpPerCapita`);
+      continue;
+    }
+    const total = bucket.members.reduce((sum, member) => sum + rows.get(member.componentId).share, 0);
+    if (Math.abs(total - 100) > COMPONENT_SPLIT_SHARE_TOLERANCE) {
+      reject(`its shares sum to ${Math.round(total * 10) / 10}, not 100`);
+      continue;
+    }
+    // Normalized to exactly 1: the bucket's macro row still sets the total.
+    splits.set(bucket.index, bucket.members.map((member) => {
+      const row = rows.get(member.componentId);
+      return {
+        geography: member.geography,
+        share: row.share / total,
+        group: row.group,
+        gdpPerCapita: Math.round(row.gdpPerCapita * 100) / 100,
+      };
+    }));
+  }
+
+  return { splits, rejected };
+};
+
 // 8B.2.18: the model now estimates a bounded set of regional macro buckets,
 // never one row per map province. Native code expands those macro estimates back
 // into the complete live-map component ledger so territorial transfers remain
@@ -618,7 +782,14 @@ export const calibrateTerritorialComponentPopulations = (componentsInput, calibr
 export const expandTerritorialMacroEstimates = (
   macroPlanInput,
   macroEstimatesInput,
-  { previousComponents: previousComponentsInput = [] } = {},
+  {
+    previousComponents: previousComponentsInput = [],
+    componentSplits = null,
+    // Components whose stored values came from an earlier split (continuity
+    // semanticSplitComponents): they keep their own group, as they keep their own
+    // productivity, instead of taking the bucket's.
+    splitGeographies = [],
+  } = {},
 ) => {
   const macroPlan = Array.isArray(macroPlanInput) ? macroPlanInput : [];
   const estimates = Array.isArray(macroEstimatesInput) ? macroEstimatesInput : [];
@@ -648,6 +819,7 @@ export const expandTerritorialMacroEstimates = (
     normalizeTerritorialComponents(previousComponentsInput)
       .map((component) => [componentKey(component.geography), component]),
   );
+  const storedSplit = new Set((Array.isArray(splitGeographies) ? splitGeographies : []).map(componentKey));
   const output = [];
   const diagnostics = [];
   const seen = new Set();
@@ -685,18 +857,35 @@ export const expandTerritorialMacroEstimates = (
     const proxyScale = priorProxyNumerator > 0 && priorProxyDenominator > 0
       ? priorProxyNumerator / priorProxyDenominator
       : 1;
-    const provisional = memberRows.map(({ geography, prior, heuristicWeight }) => ({
-      geography,
-      group: estimate.group,
-      population: Math.max(1, Math.round(
-        prior && Number(prior.population) > 0
-          ? Number(prior.population)
-          : heuristicWeight * proxyScale,
-      )),
-      gdpPerCapita: prior && Number(prior.gdpPerCapita) > 0
-        ? Number(prior.gdpPerCapita)
-        : estimate.gdpPerCapita,
-    }));
+    // A validated per-component split (decodeTerritorialComponentSplit) replaces
+    // both the weights and any prior proportions for this bucket: it is the
+    // semantic split the ledger was missing. Its shares are exact fractions of the
+    // bucket, and each component keeps its own group and relative productivity.
+    const split = componentSplits instanceof Map ? componentSplits.get(index) : null;
+    const splitByGeography = Array.isArray(split) && split.length === memberRows.length
+      ? new Map(split.map((entry) => [componentKey(entry.geography), entry]))
+      : null;
+    const useSplit = Boolean(splitByGeography && memberRows.every(({ geography }) => splitByGeography.has(componentKey(geography))));
+    const provisional = memberRows.map(({ geography, prior, heuristicWeight }) => {
+      if (useSplit) {
+        const entry = splitByGeography.get(componentKey(geography));
+        return {
+          geography,
+          group: entry.group,
+          population: Math.max(1, Math.round(entry.share * estimate.population)),
+          gdpPerCapita: entry.gdpPerCapita,
+        };
+      }
+      const hasPrior = Boolean(prior && Number(prior.population) > 0);
+      return {
+        geography,
+        group: hasPrior && storedSplit.has(componentKey(geography)) ? prior.group : estimate.group,
+        population: Math.max(1, Math.round(hasPrior ? Number(prior.population) : heuristicWeight * proxyScale)),
+        gdpPerCapita: prior && Number(prior.gdpPerCapita) > 0
+          ? Number(prior.gdpPerCapita)
+          : estimate.gdpPerCapita,
+      };
+    });
 
     const scaled = scaleComponentPopulationExact(provisional, () => true, estimate.population);
     if (scaled.error) return { components: [], error: `macro bucket ${index}: ${scaled.error}` };
@@ -710,7 +899,6 @@ export const expandTerritorialMacroEstimates = (
       : 1;
     const finalBucket = scaled.components.map((component) => ({
       ...component,
-      group: estimate.group,
       gdpPerCapita: Math.max(1, Math.round(component.gdpPerCapita * pcRatio * 100) / 100),
     }));
 
@@ -721,6 +909,7 @@ export const expandTerritorialMacroEstimates = (
       population: estimate.population,
       gdpPerCapita: estimate.gdpPerCapita,
       group: estimate.group,
+      split: useSplit,
     });
   }
 
@@ -783,12 +972,27 @@ export const mergeCountryStatPatch = (
   const stability = normalizePercent(patch.stability);
   if (stability != null) merged.stability = Math.round(stability);
 
+  const customStatsPatch = normalizeCustomCountryStats(patch.customStats);
+  if (customStatsPatch) {
+    merged.customStats = {
+      ...(base.customStats || {}),
+      ...customStatsPatch,
+    };
+  }
+
+  // Full native Stats generation attaches the scenario's exact index key list.
+  // Preserve that metadata on first persistence so completeness checks do not
+  // silently fall back to the stock modern six for custom-era scenarios. It also
+  // scopes the patch normalizer: ordinary/default sheets still reject stray keys.
+  const patchIndexKeys = normalizeIndexKeys(patch.indexKeys);
+  const expectedIndexKeys = patchIndexKeys || normalizeIndexKeys(base.indexKeys) || INDEX_KEYS;
   if (patch.indices && typeof patch.indices === "object" && !Array.isArray(patch.indices)) {
     merged.indices = {
       ...(base.indices || {}),
-      ...(normalizeIndices(patch.indices) || {}),
+      ...(normalizeCountryStatIndices(patch.indices, { allowedKeys: expectedIndexKeys }) || {}),
     };
   }
+  if (patchIndexKeys) merged.indexKeys = patchIndexKeys;
 
   if (patch.gdpBreakdown && typeof patch.gdpBreakdown === "object" && !Array.isArray(patch.gdpBreakdown)) {
     merged.gdpBreakdown = normalizeBreakdown({
@@ -803,11 +1007,26 @@ export const mergeCountryStatPatch = (
     ...economyPatch,
   };
 
+  // Preserve the explicit territorial accounting contract through the single
+  // mutation boundary. This matters for valid landless/non-territorial actors:
+  // `territorialComponents: []` is meaningful canonical state, not the same as
+  // an omitted/unknown ledger. A mapped polity can still fail closed later if
+  // its explicit replacement ledger is empty.
+  const patchTerritorialScope = clean(patch.territorialScope).toLowerCase();
+  if (TERRITORIAL_SCOPE_SET.has(patchTerritorialScope)) {
+    merged.territorialScope = patchTerritorialScope;
+  }
+
+  const baseHasExplicitComponents = Array.isArray(base.territorialComponents);
+  const patchHasExplicitComponents = Array.isArray(patch.territorialComponents);
+  let preserveExplicitComponentLedger = baseHasExplicitComponents;
+
   let components = normalizeTerritorialComponents(base.territorialComponents);
-  if (Array.isArray(patch.territorialComponents)) {
+  if (patchHasExplicitComponents) {
     components = replaceComponents
       ? normalizeTerritorialComponents(patch.territorialComponents)
       : mergeComponentsByGeography(components, patch.territorialComponents);
+    if (replaceComponents) preserveExplicitComponentLedger = true;
   }
 
   // Aggregate population edits are supported for GM/editor convenience. The
@@ -875,7 +1094,9 @@ export const mergeCountryStatPatch = (
     }
   }
 
-  if (components.length) merged.territorialComponents = components;
+  if (components.length || preserveExplicitComponentLedger) {
+    merged.territorialComponents = components;
+  }
 
   return finalizeCountryStatSheet(merged);
 };
@@ -913,7 +1134,7 @@ const HISTORY_BREAKDOWN_KEYS = Object.freeze([
 
 const normalizeHistoryDate = (value) => {
   const text = clean(value);
-  return /^\d{4}-\d{2}-\d{2}$/.test(text) ? text : "";
+  return isGameDate(text) ? text : "";
 };
 
 const historyNumber = (value) => {
@@ -940,11 +1161,15 @@ export const normalizeCountryStatHistorySample = (value) => {
 
   copyNumber("stability");
   for (const key of HISTORY_INDEX_KEYS) copyNumber(key);
+  const indices = normalizeCountryStatIndices(value.indices, { allowedKeys: null });
+  if (indices) out.indices = indices;
   copyNumber("population");
   copyNumber("corePopulation");
   copyNumber("otherPopulation");
   for (const key of HISTORY_ECONOMY_KEYS) copyNumber(key);
   for (const key of HISTORY_BREAKDOWN_KEYS) copyNumber(key);
+  const customStats = normalizeCustomCountryStats(value.customStats);
+  if (customStats) out.customStats = customStats;
 
   return Object.keys(out).length > 3 ? out : null;
 };
@@ -960,6 +1185,7 @@ export const buildCountryStatHistorySample = (sheetInput, { date = "", round = 0
     date: sampleDate,
     round,
     stability: sheet.stability,
+    indices: sheet.indices,
     sovereignty: sheet.indices?.sovereignty,
     foodAutonomy: sheet.indices?.foodAutonomy,
     energyAutonomy: sheet.indices?.energyAutonomy,
@@ -979,6 +1205,7 @@ export const buildCountryStatHistorySample = (sheetInput, { date = "", round = 0
     agriculture: sheet.gdpBreakdown?.agriculture,
     industry: sheet.gdpBreakdown?.industry,
     services: sheet.gdpBreakdown?.services,
+    customStats: sheet.customStats,
   });
 };
 
@@ -990,7 +1217,7 @@ const normalizeHistorySeries = (value) => {
     if (sample) byDate.set(sample.date, sample); // latest source wins deterministically
   }
   return [...byDate.values()]
-    .sort((a, b) => a.date.localeCompare(b.date) || Number(a.round || 0) - Number(b.round || 0))
+    .sort((a, b) => compareGameDates(a.date, b.date) || Number(a.round || 0) - Number(b.round || 0))
     .slice(-COUNTRY_STATS_HISTORY_MAX_SAMPLES);
 };
 
@@ -1060,10 +1287,13 @@ export const isCompleteCountryStatSheet = (value) => {
   if (!sheet || sheet.statsSchemaVersion !== COUNTRY_STATS_SCHEMA_VERSION) return false;
   if (!["capital", "continent", "government", "leader"].every((key) => clean(sheet[key]))) return false;
   if (!Number.isFinite(Number(sheet.stability))) return false;
-  if (!INDEX_KEYS.every((key) => Number.isFinite(Number(sheet.indices?.[key])))) return false;
-  if (!Array.isArray(sheet.territorialComponents) || sheet.territorialComponents.length < 1) return false;
-  if (!(Number(sheet.population?.total) > 0)) return false;
-  if (!(Number(sheet.economy?.gdp) > 0) || !(Number(sheet.economy?.gdpPerCapita) > 0)) return false;
+  const expectedIndexKeys = normalizeIndexKeys(sheet.indexKeys) || INDEX_KEYS;
+  if (!expectedIndexKeys.length || !expectedIndexKeys.every((key) => Number.isFinite(Number(sheet.indices?.[key])))) return false;
+  if (!Array.isArray(sheet.territorialComponents)) return false;
+  const nonterritorial = sheet.territorialScope === "nonterritorial";
+  if (!nonterritorial && sheet.territorialComponents.length < 1) return false;
+  if (!nonterritorial && !(Number(sheet.population?.total) > 0)) return false;
+  if (!nonterritorial && (!(Number(sheet.economy?.gdp) > 0) || !(Number(sheet.economy?.gdpPerCapita) > 0))) return false;
   if (!["gdpGrowth", "inflation", "unemployment", "publicDebt", "budgetBalance"].every(
     (key) => Number.isFinite(Number(sheet.economy?.[key])),
   )) return false;
@@ -1071,6 +1301,13 @@ export const isCompleteCountryStatSheet = (value) => {
   const breakdown = sheet.gdpBreakdown;
   if (!breakdown || breakdown.agriculture + breakdown.industry + breakdown.services !== 100) return false;
   return true;
+};
+
+export const isCompleteCustomCountryStatSheet = (value, expectedKeys = []) => {
+  const sheet = normalizeCountryStatSheet(value);
+  if (!sheet || !sheet.customStats) return false;
+  const keys = (Array.isArray(expectedKeys) ? expectedKeys : []).map(clean).filter(Boolean);
+  return keys.length > 0 && keys.every((key) => Number.isFinite(Number(sheet.customStats?.[key])));
 };
 
 export const buildEconomicConditionSummary = (value) => {
@@ -1173,6 +1410,10 @@ export const guardCountryStatContinuity = (
     elapsedYears = 0,
     evidenceText = "",
     territoryChanged = false,
+    // Components whose values THIS assessment set by a per-component split. That
+    // split is their first real value, not a re-roll: holding it to the band
+    // around a region-count estimate would restore the very number it replaces.
+    freshlySplitGeographies = [],
   } = {},
 ) => {
   const previous = finalizeCountryStatSheet(previousValue);
@@ -1186,11 +1427,12 @@ export const guardCountryStatContinuity = (
   const restored = [];
   const years = Math.max(0, Number(elapsedYears) || 0);
   const genericEvidence = Boolean(clean(evidenceText));
+  const freshlySplit = new Set((Array.isArray(freshlySplitGeographies) ? freshlySplitGeographies : []).map(componentKey));
 
   let components = normalizeTerritorialComponents(candidate.territorialComponents)
     .map((component) => {
       const prior = previousComponents.get(componentKey(component.geography));
-      if (!prior) return component;
+      if (!prior || freshlySplit.has(componentKey(component.geography))) return component;
 
       const specificEvidence = evidenceMentionsGeography(evidenceText, component.geography);
       // Longer spans naturally permit larger cumulative demographic/productivity

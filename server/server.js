@@ -1,4 +1,4 @@
-/*! Open Historia — portions (CORS, AI relay, shutdown endpoint, hub proxy) © 2026 Nicholas Krol, MIT (see src/Editor/LICENSE). */
+/*! Open Historia — portions (CORS, AI relay, shutdown endpoint, hub proxy) © 2026 Nicholas Krol, AGPL-3.0-or-later (see LICENSE). */
 import crypto from "crypto";
 import express from "express";
 import fs from "fs";
@@ -14,18 +14,23 @@ import {
   deleteScenario,
   ensureGameStore,
   ensureScenarioStore,
+  exportGameBundle,
   exportScenarioBundle,
   getGameCatalog,
   getGameDetails,
   getLibraryCatalog,
   getScenarioCatalog,
   getScenarioDetails,
+  importGameBundle,
   importScenarioBundle,
   updateScenarioFromBundle,
+  readGameSnapshots,
   readRuntimeJsonAsset,
+  resolveRuntimeGeojsonAsset,
   removeGameAsset,
   removeScenarioAsset,
   resolveGameUploadAsset,
+  resolveScenarioCoarseRegionsAsset,
   resolveScenarioUploadAsset,
   resolveRuntimeBinaryAsset,
   setActiveGame,
@@ -34,6 +39,7 @@ import {
   updateScenario,
   uploadGameAsset,
   uploadScenarioAsset,
+  writeGameSnapshots,
   writeRuntimeJsonAsset,
 } from "./libraryStore.js";
 import {
@@ -61,7 +67,7 @@ import {
   relayTargetAllowed,
   sanitizeRelayHeaders,
 } from "./security.js";
-import { appendLog, appendLogBatch, readLogTail, logFilePath } from "./logStore.js";
+import { appendLog, clearLog, readLogSince } from "./logStore.js";
 
 const __dirname = path.dirname(url.fileURLToPath(import.meta.url));
 import { DATA_DIR } from "./dataDir.js";
@@ -383,31 +389,33 @@ app.put("/api/ui-settings", jsonParser, (req, res) => {
   }
 });
 
-// ---- Diagnostics log ------------------------------------------------------
-// The page, the AI layer and the Electron main process all write here, so a bug
-// report can carry what actually happened instead of "it broke". Redaction and
-// rotation live in logStore.js. This sits behind the same cross-origin write
-// guard as every other POST, so a random page cannot stuff the player's log.
-app.post("/api/log", largeJsonParser, (req, res) => {
-  try {
-    const body = req.body ?? {};
-    const written = Array.isArray(body.entries)
-      ? appendLogBatch(body.entries)
-      : (appendLog(body), 1);
-    res.json({ ok: true, written });
-  } catch (error) {
-    sendError(res, 400, error);
-  }
-});
-
+// ---- Desktop log ----------------------------------------------------------
+// Where this server and the Electron process write their own entries
+// (logStore.js). The page keeps its own Diagnostics log and never writes here;
+// it reads these entries back to merge into the Logging file a player sends.
+//
+// Readable by any device that can reach this server — in practice the host
+// player's own phone, whose report should carry the host's errors — which is
+// only this machine unless the host turned on LAN play.
 app.get("/api/log", (req, res) => {
   try {
-    const limit = Number.parseInt(String(req.query.limit ?? "500"), 10);
     res.setHeader("Cache-Control", "no-store");
-    res.json({ file: logFilePath(), entries: readLogTail(Number.isFinite(limit) ? limit : 500) });
+    res.json({ entries: readLogSince(String(req.query.since ?? "")) });
   } catch (error) {
     sendError(res, 500, error);
   }
+});
+
+// The player turned Logging off. Only this machine may do that to its own files:
+// another device's switch covers that device's log, and "the log on this
+// device is deleted" is what Settings promises. Not through sendError, which
+// would write the refusal into the log it refused to clear.
+app.delete("/api/log", (req, res) => {
+  if (!isLoopbackAddress(req.socket?.remoteAddress)) {
+    res.status(403).json({ error: "Only the machine running the server can clear its Desktop log." });
+    return;
+  }
+  res.json({ ok: true, removed: clearLog() });
 });
 
 app.get("/api/scenarios", (_req, res) => {
@@ -572,8 +580,8 @@ app.put("/api/scenarios/:scenarioId", jsonParser, (req, res) => {
 
 app.get("/api/scenarios/:scenarioId/export", (req, res) => {
   try {
-    const mode = req.query?.mode === "full" ? "full" : "light";
-    res.json(exportScenarioBundle(req.params.scenarioId, { mode }));
+    // Always the whole scenario; the old ?mode=light is accepted and ignored.
+    res.json(exportScenarioBundle(req.params.scenarioId));
   } catch (error) {
     sendError(res, 400, error);
   }
@@ -599,7 +607,12 @@ app.put("/api/scenarios/:scenarioId/import", largeJsonParser, (req, res) => {
 
 app.get("/api/scenarios/:scenarioId/assets/:assetKey", (req, res) => {
   try {
-    const asset = resolveScenarioUploadAsset(req.params.scenarioId, req.params.assetKey);
+    // ?coarse=1 on the regions: the far tier's coarsening of the same file,
+    // for previews that never zoom in (the country picker).
+    const coarse = req.params.assetKey === "regionsGeojson" && req.query?.coarse === "1";
+    const asset = coarse
+      ? resolveScenarioCoarseRegionsAsset(req.params.scenarioId)
+      : resolveScenarioUploadAsset(req.params.scenarioId, req.params.assetKey);
     streamBinaryFile(req, res, asset.sourcePath, asset.contentType);
   } catch (error) {
     sendError(res, 404, error);
@@ -637,6 +650,46 @@ app.get("/api/games/:gameId", (req, res) => {
     res.json(getGameDetails(req.params.gameId));
   } catch (error) {
     sendError(res, 404, error);
+  }
+});
+
+// Export one game as a bundle, and import one back. The zip around it is built
+// in the client (src/runtime/gameZip.js) so the web build, which has no
+// server at all, gets the same file from the same code.
+app.get("/api/games/:gameId/export", (req, res) => {
+  try {
+    res.json(exportGameBundle(req.params.gameId));
+  } catch (error) {
+    sendError(res, 404, error);
+  }
+});
+
+app.post("/api/games/import", largeJsonParser, (req, res) => {
+  try {
+    // Never setActive: an import must not switch the game the player is in.
+    res.status(201).json(importGameBundle(req.body ?? {}));
+  } catch (error) {
+    sendError(res, 400, error);
+  }
+});
+
+// Restore points, separately from the bundle above, because they are ~40x its
+// size and the client moves them as text it never parses. Only reachable per
+// game id — /api/runtime/json/snapshots is scoped to the ACTIVE game and an
+// export is usually of some other one.
+app.get("/api/games/:gameId/snapshots", (req, res) => {
+  try {
+    res.json(readGameSnapshots(req.params.gameId));
+  } catch (error) {
+    sendError(res, 404, error);
+  }
+});
+
+app.put("/api/games/:gameId/snapshots", largeJsonParser, (req, res) => {
+  try {
+    res.json(writeGameSnapshots(req.params.gameId, req.body));
+  } catch (error) {
+    sendError(res, 400, error);
   }
 });
 
@@ -725,6 +778,14 @@ app.delete("/api/scenarios/:scenarioId", (req, res) => {
 
 app.get("/api/runtime/json/:assetKey", (req, res) => {
   try {
+    // Scenario geometry is served untransformed, so parsing it only to
+    // re-serialise blocked the event loop for seconds on a 55 MB file. A null
+    // sourcePath means no custom geometry: fall through to the empty payload.
+    const geojson = resolveRuntimeGeojsonAsset(req.params.assetKey);
+    if (geojson?.sourcePath) {
+      streamBinaryFile(req, res, geojson.sourcePath, geojson.contentType);
+      return;
+    }
     const asset = readRuntimeJsonAsset(req.params.assetKey);
     res.setHeader("Cache-Control", "no-store");
     res.type("application/json");
@@ -789,6 +850,30 @@ const HUB_DOWNLOAD_HOSTS = new Set([
   "github-production-user-asset-6210df.s3.amazonaws.com",
 ]);
 const HUB_MAX_BUNDLE_BYTES = 200 * 1024 * 1024;
+
+// One hop of a hub download. fetch() has no timeout of its own, so a connection
+// that never opens — an IPv6 route that blackholes, a proxy that drops the SYN —
+// held the request until the OS gave up (ETIMEDOUT, twenty-odd seconds on
+// Windows) and the player saw "fetch failed (ETIMEDOUT)" for a pack that was
+// fine a minute earlier. Each hop is bounded generously (bundles run to tens of
+// megabytes on slow links) and a transport failure is retried once before it
+// is reported; an HTTP error is never retried.
+const HUB_HOP_TIMEOUT_MS = 120_000;
+const HUB_TRANSIENT_CODES = new Set([
+  "ETIMEDOUT", "ECONNRESET", "ECONNREFUSED", "EAI_AGAIN", "EPIPE",
+  "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_SOCKET", "TimeoutError",
+]);
+const fetchHubHop = async (url) => {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await fetch(url, { redirect: "manual", signal: AbortSignal.timeout(HUB_HOP_TIMEOUT_MS) });
+    } catch (error) {
+      const code = error?.cause?.code || error?.code || error?.name || "";
+      if (attempt >= 1 || !HUB_TRANSIENT_CODES.has(code)) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 750));
+    }
+  }
+};
 
 // This route echoes a file that ANY member of the public can attach to a hub
 // issue, and it serves it from the game's OWN origin. Without these two headers a
@@ -1089,7 +1174,7 @@ app.get("/api/hub/file", async (req, res) => {
       if (hop > 5) {
         return sendError(res, 502, new Error("Too many redirects fetching scenario file."));
       }
-      upstream = await fetch(current, { redirect: "manual" });
+      upstream = await fetchHubHop(current);
       if (upstream.status < 300 || upstream.status >= 400) break;
       const location = upstream.headers.get("location");
       if (!location) break;

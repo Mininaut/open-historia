@@ -1,4 +1,4 @@
-/*! Open Historia — map feature (city/structure) selection UI © 2026 Nicholas Krol, MIT (see src/Editor/LICENSE). */
+/*! Open Historia — map feature (city/structure) selection UI © 2026 Nicholas Krol, AGPL-3.0-or-later (see LICENSE). */
 import React, { useEffect, useState } from "react";
 import { createPortal } from "react-dom";
 import { useMap } from "react-map-gl/maplibre";
@@ -25,6 +25,12 @@ export const onFeatureSelected = (payload) => {
     return;
   }
   if (_currentSelection) _dismiss?.();
+  _setSelection(payload);
+};
+
+// Search opens a feature without a click's toggle, so landing on the one already open leaves it open.
+export const focusFeature = (payload) => {
+  if (!_setSelection || !payload?.name) return;
   _setSelection(payload);
 };
 

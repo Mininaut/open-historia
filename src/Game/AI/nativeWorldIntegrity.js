@@ -1,4 +1,5 @@
 import { resolveStockCountryCode } from "../../runtime/polityIdentity.js";
+import { compareGameDates, gameDateDayNumber } from "../../runtime/gameDates.js";
 // Native World Integrity (ported from kernely's Continuum branch).
 //
 // This module is deliberately separate from the World Director and Timeline
@@ -202,11 +203,10 @@ const stableHash = (value) => {
   return hash >>> 0;
 };
 
+// Milliseconds for a game date, BC included (runtime/gameDates.js).
 const parseIsoDate = (value) => {
-  const text = normalizeString(value);
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(text)) return null;
-  const time = Date.parse(`${text}T00:00:00Z`);
-  return Number.isFinite(time) ? time : null;
+  const dayNumber = gameDateDayNumber(value);
+  return dayNumber === null ? null : dayNumber * 86400000;
 };
 
 export const worldIntegrityAgeDays = (originDate, eventDate) => {
@@ -219,8 +219,8 @@ export const worldIntegrityAgeDays = (originDate, eventDate) => {
 export const latestCanonicalWorldEventDate = (events, originDate) =>
   normalizeArray(events)
     .map((event) => normalizeString(event?.date))
-    .filter((date) => parseIsoDate(date) != null && (!originDate || date <= originDate))
-    .sort()
+    .filter((date) => parseIsoDate(date) != null && (!originDate || compareGameDates(date, originDate) <= 0))
+    .sort(compareGameDates)
     .at(-1) || "";
 
 const activeWarEntries = (world) =>
@@ -1848,7 +1848,7 @@ const applyLowTrajectoryFeedGuard = ({
     .filter(({ event }) => lowTrajectoryInstitutionalEvent(event));
 
   if (currentLow.length < LOW_TRAJECTORY_BATCH_TRIGGER) {
-    return { events: source, dropped: [] };
+    return { events: source, dropped: [], hidden: [] };
   }
 
   const recentLowCount = normalizeArray(priorEvents)
@@ -1857,7 +1857,7 @@ const applyLowTrajectoryFeedGuard = ({
     .length;
 
   const cap = recentLowCount >= LOW_TRAJECTORY_RECENT_SATURATION ? 1 : 2;
-  if (currentLow.length <= cap) return { events: source, dropped: [] };
+  if (currentLow.length <= cap) return { events: source, dropped: [], hidden: [] };
 
   const classifyScope = createWorldEventScopeClassifier(analysis, {
     world,
@@ -1885,13 +1885,14 @@ const applyLowTrajectoryFeedGuard = ({
     })
     .sort((a, b) =>
       (b.keepScore - a.keepScore) ||
-      String(a.event?.date || "").localeCompare(String(b.event?.date || "")) ||
+      compareGameDates(a.event?.date || "", b.event?.date || "") ||
       a.index - b.index
     );
 
   const keepIndexes = new Set(ranked.slice(0, cap).map((row) => row.index));
   const lowIndexes = new Set(currentLow.map((row) => row.index));
   const dropped = [];
+  const hidden = [];
   const kept = [];
 
   source.forEach((event, index) => {
@@ -1899,7 +1900,7 @@ const applyLowTrajectoryFeedGuard = ({
       kept.push(event);
       return;
     }
-    dropped.push({
+    const row = {
       id: normalizeString(event?.id),
       title: normalizeString(event?.title),
       route: "LOW_TRAJECTORY_FEED_SATURATION",
@@ -1908,10 +1909,12 @@ const applyLowTrajectoryFeedGuard = ({
         (recentLowCount >= LOW_TRAJECTORY_RECENT_SATURATION
           ? ` and ${recentLowCount}/${LOW_TRAJECTORY_RECENT_WINDOW} recent cards were already the same low-branch texture`
           : ""),
-    });
+    };
+    dropped.push(row);
+    hidden.push({ event, route: row.route, reason: row.reason });
   });
 
-  return { events: kept, dropped };
+  return { events: kept, dropped, hidden };
 };
 
 export const screenGeneratedWorldEvents = ({
@@ -1923,6 +1926,15 @@ export const screenGeneratedWorldEvents = ({
 } = {}) => {
   const kept = [];
   const dropped = [];
+  // Canonical events kept off the timeline by a VISIBILITY rule (routine,
+  // low-value) are handed on whole: they still happened, and the Board reads
+  // every Canonical event. `dropped` stays the audit of everything removed; a
+  // rejection (the wartime-causality rule) is in `dropped` and never here.
+  const hidden = [];
+  const keepOffTimeline = (event, route, reason) => {
+    dropped.push({ id: normalizeString(event?.id), title: normalizeString(event?.title), route, reason });
+    hidden.push({ event, route, reason });
+  };
   let strippedPolityUpdates = 0;
   let mergedDuplicatePolityUpdates = 0;
   let strippedNoOpRegionControlOps = 0;
@@ -1964,23 +1976,13 @@ export const screenGeneratedWorldEvents = ({
     const routineReason = routineMilitaryNoDeltaReason(event);
 
     if (routineReason) {
-      dropped.push({
-        id: normalizeString(event?.id),
-        title: normalizeString(event?.title),
-        route: "ROUTINE_MILITARY_PRECURATION",
-        reason: routineReason,
-      });
+      keepOffTimeline(event, "ROUTINE_MILITARY_PRECURATION", routineReason);
       continue;
     }
 
     const administrativeReason = routineAdministrativeNoDeltaReason(event);
     if (administrativeReason) {
-      dropped.push({
-        id: normalizeString(event?.id),
-        title: normalizeString(event?.title),
-        route: "ROUTINE_ADMINISTRATIVE_PROCESS",
-        reason: administrativeReason,
-      });
+      keepOffTimeline(event, "ROUTINE_ADMINISTRATIVE_PROCESS", administrativeReason);
       continue;
     }
 
@@ -1995,10 +1997,12 @@ export const screenGeneratedWorldEvents = ({
     game,
   });
   if (feedGuard.dropped.length) dropped.push(...feedGuard.dropped);
+  hidden.push(...feedGuard.hidden);
 
   const result = {
     events: feedGuard.events,
     dropped,
+    hidden,
     strippedPolityUpdates,
     mergedDuplicatePolityUpdates,
     strippedNoOpRegionControlOps,
@@ -2018,8 +2022,9 @@ export const screenGeneratedWorldEvents = ({
       `kept ${result.events.length}/${normalizeArray(events).length} generated event(s); ` +
       `dropped ${dropped.length}, stripped ${strippedPolityUpdates} unsupported polity update(s), ` +
       `merged ${mergedDuplicatePolityUpdates} duplicate polity update(s), ` +
-      `stripped ${strippedNoOpRegionControlOps} no-op control op(s).`,
-      result,
+      `stripped ${strippedNoOpRegionControlOps} no-op control op(s); ${hidden.length} kept off the timeline for the Board.`,
+      // The Hidden events are whole events; `dropped` already names them.
+      { ...result, hidden: hidden.length },
     );
   }
 

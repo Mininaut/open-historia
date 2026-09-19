@@ -1,4 +1,4 @@
-/*! Open Historia — intelligence-rating pipeline tests © 2026 Nicholas Krol, MIT (see src/Editor/LICENSE). */
+/*! Open Historia — intelligence-rating pipeline tests © 2026 Nicholas Krol, AGPL-3.0-or-later (see LICENSE). */
 // Run: node --test src/Game/AI/intelligenceRating.test.js
 //
 // Reported: a player built spy training academies and researched the tech for a
@@ -73,8 +73,8 @@ test("the rating survives the save round trip that persists it", () => {
 });
 
 test("a rating addressed to a polity's display name lands on the polity", () => {
-  // The turn after a rename the model answers with the new name; the rating must
-  // follow the token like every other owner-keyed field (see ownerNames.js).
+  // A record still showing a display name over its key is re-keyed by that name
+  // on apply (polityRename.js), and the rating written to the name lands there.
   const { world } = applyEventImpactsToWorld({
     world: {
       polityOverrides: { Russia: { code: "Russia", name: "Russian Federation" } },
@@ -83,7 +83,7 @@ test("a rating addressed to a polity's display name lands on the polity", () => 
     events: [event({ polityChanges: [{ code: "Russian Federation", intelligence: 80 }] })],
   });
 
-  assert.deepEqual(world.intelligence, { Russia: 80 });
+  assert.deepEqual(world.intelligence, { "Russian Federation": 80 });
 });
 
 test("an unrated polity is ordinary rather than absent", () => {

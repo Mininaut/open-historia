@@ -1,4 +1,4 @@
-/*! Open Historia — in-app update-check helpers © 2026 Nicholas Krol, MIT (see src/Editor/LICENSE). */
+/*! Open Historia — in-app update-check helpers © 2026 Nicholas Krol, AGPL-3.0-or-later (see LICENSE). */
 
 // Pure, dependency-free so the version comparison is unit-tested without a browser
 // or a running server. The banner (AppUpdateBanner.jsx) is the only consumer.
@@ -65,4 +65,15 @@ export const isUpdateAvailable = (currentBuild, latest) => {
   const manifest = parseUpdateManifest(latest);
   if (current == null || !manifest) return false;
   return manifest.build > current;
+};
+
+// What the banner says when the app's own updater gives up. The main process
+// keeps electron-updater's message verbatim (main.cjs updateState.error) and the
+// banner used to swallow it: a player saw "0%" flip back to "Update now" and
+// nothing else. One sentence, the reason kept when there is one, clipped so a
+// stack trace cannot take over the banner.
+export const describeUpdateFailure = (error) => {
+  const reason = String(error ?? "").replace(/\s+/g, " ").trim().replace(/[.\s]+$/, "");
+  const clipped = reason.length > 160 ? `${reason.slice(0, 159)}…` : reason;
+  return clipped ? `The app could not update itself: ${clipped}.` : "The app could not update itself.";
 };

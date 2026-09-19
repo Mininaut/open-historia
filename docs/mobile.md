@@ -159,7 +159,7 @@ Every asset is routed into the **writable** `OH_DATA_DIR`, never the read-only b
 
 | Manifest `path` prefix | Written to | Example |
 |---|---|---|
-| `server/data/…` | `<DATA_DIR>/…` | `server/data/scenarios/default/regions.geojson` → `<DATA_DIR>/scenarios/default/regions.geojson` |
+| `server/data/…` | `<DATA_DIR>/…` | `server/data/stock/regions.geojson` → `<DATA_DIR>/stock/regions.geojson` |
 | `public/assets/…` | `<DATA_DIR>/assets/…` | `public/assets/regions.pmtiles` → `<DATA_DIR>/assets/regions.pmtiles` |
 | anything else | `<DATA_DIR>/<path>` verbatim | keeps it out of the read-only bundle |
 

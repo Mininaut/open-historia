@@ -78,7 +78,7 @@ Commit under **your own GitHub-linked identity** (use your GitHub `noreply` emai
 
 ### License-banner authorship is separate from Git authorship
 
-The **file-header license banners** (§5) credit **Nicholas Krol** because they mark the portions covered by the map-editor MIT license — that is a *licensing* statement, not a claim of Git authorship. Don't remove or rewrite an existing banner when you edit a file; leave the attribution intact.
+The **file-header license banners** (§5) credit **Nicholas Krol** because they mark the portions he authored — that is a *licensing* statement, not a claim of Git authorship. Don't remove or rewrite an existing banner when you edit a file; leave the attribution intact.
 
 ---
 
@@ -86,22 +86,22 @@ The **file-header license banners** (§5) credit **Nicholas Krol** because they 
 
 ### License banners on source files
 
-Almost every source file (~111 across `src/`, `server/`, `scripts/`) opens with a one-line (or short block) MIT banner pointing at `src/Editor/LICENSE`. Two forms are in use:
+Almost every source file (~111 across `src/`, `server/`, `scripts/`) opens with a one-line (or short block) AGPL banner pointing at `LICENSE`. Two forms are in use:
 
 ```js
-/*! Open Historia — portions (short description of what this file does) © 2026 Nicholas Krol, MIT (see src/Editor/LICENSE). */
+/*! Open Historia — portions (short description of what this file does) © 2026 Nicholas Krol, AGPL-3.0-or-later (see LICENSE). */
 ```
 
 ```js
 /*!
  * Open Historia Map Editor
- * Copyright (c) 2026 Nicholas Krol - MIT License (see src/Editor/LICENSE).
+ * Copyright (c) 2026 Nicholas Krol - AGPL-3.0-or-later (see LICENSE).
  */
 ```
 
 Even config, workflows, and `.gitattributes` carry the banner (`.github/workflows/*.yml:1`, `vite.config.ts:1`, `eslint.config.js` excepted). **When you add a new file, add a banner** in the same style with a short parenthetical describing the file's role. When you edit an existing file, keep its banner.
 
-Licensing is split by directory: the map editor and its tooling — the contents of `src/Editor/`, `scripts/extract-regions.mjs`, and `server/mapEditorStore.js` — are MIT © Nicholas Krol per `src/Editor/LICENSE`; the project as a whole is MIT © "Developers of the Open-Historia Project" per the top-level `LICENSE`.
+The whole project — including the map editor and its tooling — is licensed **AGPL-3.0-or-later** under the top-level `LICENSE`. The previous MIT carve-out for `src/Editor/`, `scripts/extract-regions.mjs`, and `server/mapEditorStore.js` was retired when the project relicensed; `src/Editor/LICENSE` no longer exists. Third-party code retains its own license — Azgaar's Fantasy Map Generator, vendored into `fmg/dist`, is MIT.
 
 ### Verbose, explanatory comments (the house style)
 
@@ -209,8 +209,8 @@ These strings are wired into external contracts (release assets players download
 | Identifier | Where | Why it's frozen |
 |-----------|-------|-----------------|
 | **`io.github.arkniem.paxhistoria`** (Capacitor `appId`) | `mobile/capacitor.config.json:2` | The Android application ID. Changing it makes every existing install a *different* app — no in-place update; users would get a duplicate. |
-| **`open-historia.apk`** (release asset name) | `.github/workflows/android-apk.yml:62,66,78` | The exact filename players download from the `android` release, and what the README and site link by name. Renamed from `pax-historia.apk` on 2026-09-04 (main `e29967e`); see delivery-and-deploy.md §4.2 for what that cost. |
-| **`android`** (rolling release tag) | `android-apk.yml:73-75` | The APK is republished to this single rolling release; the app updates itself from it. |
+| **`open-historia.apk`** (release asset name) | `.github/workflows/android-apk.yml:60,64,76` | The exact filename players download from the `android` release, and what the README and site link by name. Renamed from `pax-historia.apk` on 2026-09-04 (main `e29967e`); see delivery-and-deploy.md §3 for what that cost. |
+| **`android`** (rolling release tag) | `android-apk.yml:74-76` | The APK is republished to this single rolling release; the app updates itself from it. |
 | **`app-stable` / `app-beta`** (release tags) | `app-bundle.yml:57-68` | The `Open-Historia.zip` download tags for the two desktop channels. |
 | **`Open-Historia.zip`** (bundle asset name) | `app-bundle.yml:54,84`; README | The one-download full app; linked by name. |
 | **`map-data`** (release) + the per-asset names | `scripts/map-assets.json` | The map-binary release and asset names (`regions.pmtiles`, `regions-seed-z8.geojson`, `default-regions-names.geojson`, …). The fetch script resolves these by name; a rename orphans every fetch. |
@@ -236,7 +236,7 @@ The gitignored / release-hosted files:
 | `public/assets/cities.pmtiles` | `cities.pmtiles` |
 | `public/assets/cities-seed.json` | `cities-seed.json` |
 | `public/assets/regions-seed.geojson` | `regions-seed-z8.geojson` |
-| `server/data/scenarios/default/regions.geojson` | `default-regions-names.geojson` |
+| `server/data/stock/regions.geojson` | `default-regions-names.geojson` |
 
 Rules of thumb:
 - **Never `git add`** any `*.pmtiles`, the seed geojson/json, or the default scenario's `regions.geojson`. They're gitignored; don't `-f` them in.
@@ -253,7 +253,7 @@ Related gitignored-but-not-in-LFS runtime artifacts you also shouldn't commit: `
 |--------------|---------|
 | Change the server API / routes | `server/server.js`, `server/*Store.js`, [Server](server.md) |
 | Touch security guards | `server/security.js` (+ `security.test.js`) |
-| Edit the map editor | `src/Editor/` (separately licensed — `src/Editor/LICENSE`) |
+| Edit the map editor | `src/Editor/` (covered by the top-level `LICENSE`) |
 | Edit the game map / UI | `src/Game/` — see [Game map](game-map.md), [Game UI](game-ui.md) |
 | World-state fields & flow | [World state](world-state.md) |
 | AI prompts / schemas | [AI overview](ai-overview.md), [AI schemas](ai-schemas.md) |

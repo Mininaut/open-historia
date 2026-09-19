@@ -54,13 +54,15 @@ const PolitiesPanel = ({
   api,
   polities = {},
   selection = [],
+  setSelection,
   regionEpoch = 0,
   colors = {},
   flags = {},
   tags = {},
   upsertPolity,
-  renamePolityDisplay,
+  renamePolity,
   removePolity,
+  removePolities,
   importPolityRoster,
   setColorOverride,
   setTags,
@@ -70,8 +72,8 @@ const PolitiesPanel = ({
 }) => {
   const [query, setQuery] = useState("");
   const [selectedKey, setSelectedKey] = useState("");
+  const [bulkSelected, setBulkSelected] = useState(() => new Set());
   const [draftName, setDraftName] = useState("");
-  const [newKey, setNewKey] = useState("");
   const [newName, setNewName] = useState("");
   const [transferFrom, setTransferFrom] = useState("");
   const [refreshNonce, setRefreshNonce] = useState(0);
@@ -115,6 +117,18 @@ const PolitiesPanel = ({
       .sort((a, b) => a.name.localeCompare(b.name) || a.key.localeCompare(b.key));
   }, [polities, usage, query]);
 
+  const allFilteredSelected = rows.length > 0 && rows.every((row) => bulkSelected.has(row.key));
+  const selectedBulkRows = useMemo(() => {
+    const allKeys = new Set([...Object.keys(polities || {}), ...usage.keys()]);
+    return [...bulkSelected]
+      .filter((key) => allKeys.has(key))
+      .map((key) => {
+        const record = polities?.[key] || null;
+        const counts = usage.get(key) || { regionCount: 0, claimantCount: 0 };
+        return { key, name: clean(record?.name) || key, regionCount: counts.regionCount || 0, claimantCount: counts.claimantCount || 0 };
+      });
+  }, [bulkSelected, polities, usage]);
+
   const current = selectedKey
     ? rows.find((row) => row.key === selectedKey) || {
         key: selectedKey,
@@ -125,25 +139,109 @@ const PolitiesPanel = ({
       }
     : null;
 
+  // The regions the selected country owns, for the list under its name: a scan
+  // of the region features, keyed like usageRows so it follows ownership edits.
+  const ownedRegions = useMemo(
+    () => (current?.key ? api?.listOwnerRegions?.(current.key) || [] : []),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [api, current?.key, regionEpoch, refreshNonce],
+  );
+
   useEffect(() => {
     setDraftName(current?.name || "");
     setTransferFrom("");
   }, [current?.key, current?.name]);
 
+  // A polity is keyed by its name: the name typed here is the key, and renaming
+  // it later re-keys everything (renamePolity).
   const createPolity = () => {
-    const key = clean(newKey || newName);
-    const name = clean(newName || newKey);
-    if (!key || !name) return;
+    const name = clean(newName);
+    const key = name;
+    if (!key) return;
     if (Object.prototype.hasOwnProperty.call(polities || {}, key) || usage.has(key)) {
-      window.alert(`A polity with the stable key “${key}” already exists.`);
+      window.alert(`A polity named “${key}” already exists.`);
       return;
     }
     upsertPolity?.(key, { name, code: key, aliases: [name], status: "active", note: "" });
+    // A country is registered the moment it is created, regions or not: with a
+    // selection it takes those regions now; otherwise it waits, landless, for
+    // the paint tool or an assignment, and ships to the game either way.
     if (selection.length) api?.setRegionAttrs?.(selection, { owner: key });
     setRefreshNonce((n) => n + 1);
     setSelectedKey(key);
-    setNewKey("");
     setNewName("");
+  };
+
+  const toggleBulkKey = (key) => {
+    setBulkSelected((previous) => {
+      const next = new Set(previous);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  };
+
+  const toggleFiltered = () => {
+    setBulkSelected((previous) => {
+      const next = new Set(previous);
+      if (allFilteredSelected) rows.forEach((row) => next.delete(row.key));
+      else rows.forEach((row) => next.add(row.key));
+      return next;
+    });
+  };
+
+  const removeManyFromMap = () => {
+    const targets = selectedBulkRows;
+    if (!targets.length) return;
+    const keys = targets.map((row) => row.key);
+    const regionCount = targets.reduce((sum, row) => sum + row.regionCount, 0);
+    const claimCount = targets.reduce((sum, row) => sum + row.claimantCount, 0);
+    const consequences = [
+      regionCount ? `${regionCount.toLocaleString()} owned region(s) become unowned` : "",
+      claimCount ? `${claimCount.toLocaleString()} territorial claim(s) are removed` : "",
+    ].filter(Boolean).join(" and ");
+    const ok = window.confirm(
+      `Delete ${targets.length.toLocaleString()} selected countries?` +
+      `${consequences ? `\n\n${consequences}.` : ""}` +
+      "\n\nTheir country records, colours, flags and tags will also be deleted.",
+    );
+    if (!ok) return;
+    api?.removeOwners?.(keys);
+    if (removePolities) removePolities(keys);
+    else keys.forEach((key) => removePolity?.(key));
+    if (keys.includes(selectedKey)) setSelectedKey("");
+    setBulkSelected(new Set());
+    setRefreshNonce((n) => n + 1);
+  };
+
+  // Removing a polity is a map operation: its regions become unowned, the
+  // claims in its name are dropped, and the record (with its colour, flag and
+  // tags) goes with them. Deleting only the record used to leave the regions
+  // keyed to it, so the polity came straight back.
+  const removeFromMap = () => {
+    if (!current?.key) return;
+    const key = current.key;
+    const owned = api?.selectOwner?.(key, { zoom: false }) || [];
+    const disputed = (api?.serializeRegions?.()?.features || []).filter((feature) =>
+      Array.isArray(feature?.properties?.claimants) && feature.properties.claimants.includes(key));
+    const summary = [
+      owned.length ? `${owned.length} region(s) become unowned` : "",
+      disputed.length ? `${disputed.length} claim(s) are dropped` : "",
+    ].filter(Boolean).join(" and ");
+    if (!window.confirm(`Remove “${current.name}” from the map?${summary ? ` ${summary};` : ""} its colour, flag and tags go with it.`)) return;
+    if (api?.removeOwners) api.removeOwners([key]);
+    else {
+      if (owned.length) api?.setRegionAttrs?.(owned, { owner: null });
+      for (const feature of disputed) {
+        const id = String(feature?.properties?.id ?? feature?.id ?? "");
+        if (!id) continue;
+        api?.setRegionAttrs?.([id], { claimants: feature.properties.claimants.filter((claimant) => claimant !== key) });
+      }
+    }
+    removePolity?.(key);
+    setBulkSelected((previous) => { const next = new Set(previous); next.delete(key); return next; });
+    setSelectedKey("");
+    setRefreshNonce((n) => n + 1);
   };
 
   const assignSelection = () => {
@@ -309,64 +407,86 @@ const PolitiesPanel = ({
     );
   };
 
-  const canDeleteRecord = Boolean(
-    current?.record && current.regionCount === 0 && current.claimantCount === 0,
-  );
-
   return (
-    <Panel title="Polities" icon="list" onClose={onClose} width={390}>
+    <Panel title="Countries" icon="list" onClose={onClose} width={390}>
       <div style={{ fontSize: 12, lineHeight: 1.45, color: "rgba(255,255,255,0.62)" }}>
-        Regions store a <b>stable polity key</b>. Rename the polity here to change its visible identity without creating a new one-province country.
+        Every country on the map is listed — it owns a region or a region is disputed in its name — and so is every country registered here, with regions or not; a registered country stays until it is removed. Click one to select its whole territory. A country is <b>keyed by its name</b>: renaming it re-keys everything that carried the old name.
       </div>
 
       <input
         value={query}
         onChange={(e) => setQuery(e.target.value)}
-        placeholder="Search polity name or stable key…"
+        placeholder="Search country name…"
         style={inputStyle}
       />
 
-      <div style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: 6, maxHeight: 230, overflowY: "auto" }}>
+      <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
+        <button type="button" style={pillButton(false)} disabled={!rows.length} onClick={toggleFiltered}>
+          {allFilteredSelected ? "Unselect filtered" : `Select filtered (${rows.length})`}
+        </button>
+        <button type="button" style={pillButton(false)} disabled={!bulkSelected.size} onClick={() => setBulkSelected(new Set())}>
+          Clear selection
+        </button>
+        <button type="button" style={pillButton(true)} disabled={!selectedBulkRows.length} onClick={removeManyFromMap}>
+          Delete selected ({selectedBulkRows.length})
+        </button>
+      </div>
+
+      <div style={{ display: "grid", gap: 6, maxHeight: 230, overflowY: "auto" }}>
         {rows.map((row) => {
           const active = row.key === selectedKey;
+          const checked = bulkSelected.has(row.key);
           return (
-            <button
-              key={row.key}
-              type="button"
-              onClick={() => setSelectedKey(row.key)}
-              style={{
-                gridColumn: "1 / -1",
-                display: "flex",
-                alignItems: "center",
-                gap: 8,
-                textAlign: "left",
-                padding: "7px 9px",
-                borderRadius: 8,
-                border: active ? "1px solid rgba(59,130,246,0.8)" : "1px solid rgba(255,255,255,0.08)",
-                background: active ? "rgba(59,130,246,0.18)" : "rgba(255,255,255,0.035)",
-                color: "white",
-                cursor: "pointer",
-              }}
-            >
-              <span
+            <div key={row.key} style={{ display: "flex", alignItems: "stretch", gap: 6 }}>
+              <label
+                title={`Include ${row.name} in bulk actions`}
+                style={{ display: "flex", alignItems: "center", justifyContent: "center", width: 30, flex: "0 0 30px", borderRadius: 8, border: checked ? "1px solid rgba(239,68,68,0.65)" : "1px solid rgba(255,255,255,0.08)", background: checked ? "rgba(239,68,68,0.12)" : "rgba(255,255,255,0.025)", cursor: "pointer" }}
+              >
+                <input
+                  type="checkbox"
+                  checked={checked}
+                  onChange={() => toggleBulkKey(row.key)}
+                  aria-label={`Select ${row.name} for bulk actions`}
+                />
+              </label>
+              <button
+                type="button"
+                onClick={() => { setSelectedKey(row.key); api?.selectOwner?.(row.key, { zoom: true }); }}
                 style={{
-                  width: 14,
-                  height: 14,
-                  borderRadius: 4,
-                  flex: "0 0 auto",
-                  background: colors?.[row.key] ? `rgb(${colors[row.key].join(",")})` : "rgba(255,255,255,0.18)",
-                  border: "1px solid rgba(255,255,255,0.25)",
+                  flex: 1,
+                  minWidth: 0,
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 8,
+                  textAlign: "left",
+                  padding: "7px 9px",
+                  borderRadius: 8,
+                  border: active ? "1px solid rgba(59,130,246,0.8)" : "1px solid rgba(255,255,255,0.08)",
+                  background: active ? "rgba(59,130,246,0.18)" : "rgba(255,255,255,0.035)",
+                  color: "white",
+                  cursor: "pointer",
                 }}
-              />
-              <span style={{ flex: 1, minWidth: 0 }}>
-                <div style={{ fontSize: 13, fontWeight: 700, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-                  {row.name}
-                </div>
-                <div style={{ fontSize: 10.5, color: "rgba(255,255,255,0.48)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-                  key: {row.key} · {row.regionCount} regions{row.claimantCount ? ` · ${row.claimantCount} claims` : ""}
-                </div>
-              </span>
-            </button>
+              >
+                <span
+                  style={{
+                    width: 14,
+                    height: 14,
+                    borderRadius: 4,
+                    flex: "0 0 auto",
+                    background: colors?.[row.key] ? `rgb(${colors[row.key].join(",")})` : "rgba(255,255,255,0.18)",
+                    border: "1px solid rgba(255,255,255,0.25)",
+                  }}
+                />
+                <span style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontSize: 13, fontWeight: 700, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                    {row.name}
+                  </div>
+                  <div style={{ fontSize: 10.5, color: "rgba(255,255,255,0.48)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                    {row.regionCount ? `${row.regionCount} regions` : "registered, no regions yet"}{row.claimantCount ? ` · ${row.claimantCount} claims` : ""}{Array.isArray(polities?.[row.key]?.formerNames) && polities[row.key].formerNames.length ? ` · formerly ${polities[row.key].formerNames.join(", ")}` : ""}
+                  </div>
+                </span>
+              </button>
+            </div>
           );
         })}
       </div>
@@ -374,23 +494,34 @@ const PolitiesPanel = ({
       {current && (
         <div style={{ display: "flex", flexDirection: "column", gap: 9, paddingTop: 8, borderTop: "1px solid rgba(255,255,255,0.1)" }}>
           <div>
-            <div style={{ fontSize: 10.5, color: "rgba(255,255,255,0.48)", marginBottom: 4 }}>Stable key</div>
-            <div style={{ ...inputStyle, opacity: 0.75, userSelect: "text" }}>{current.key}</div>
-          </div>
-
-          <div>
-            <div style={{ fontSize: 10.5, color: "rgba(255,255,255,0.48)", marginBottom: 4 }}>Current display name</div>
+            <div style={{ fontSize: 10.5, color: "rgba(255,255,255,0.48)", marginBottom: 4 }}>Name</div>
             <div style={{ display: "flex", gap: 6 }}>
               <input value={draftName} onChange={(e) => setDraftName(e.target.value)} style={inputStyle} />
               <button
                 type="button"
                 style={pillButton(false)}
-                disabled={!clean(draftName) || clean(draftName) === current.name}
-                onClick={() => renamePolityDisplay?.(current.key, draftName)}
+                disabled={!clean(draftName) || clean(draftName) === current.key}
+                title="Renames the country everywhere on this map: its regions, claims, colour, flag, tags and cities. The old name is kept as a former name."
+                onClick={() => {
+                  const next = clean(draftName);
+                  const previousKey = current.key;
+                  renamePolity?.(previousKey, next);
+                  setBulkSelected((previous) => {
+                    if (!previous.has(previousKey)) return previous;
+                    const updated = new Set(previous);
+                    updated.delete(previousKey);
+                    updated.add(next);
+                    return updated;
+                  });
+                  setSelectedKey(next);
+                }}
               >
                 Rename
               </button>
             </div>
+            {Array.isArray(current.record?.formerNames) && current.record.formerNames.length > 0 && (
+              <div style={{ fontSize: 10.5, color: "rgba(255,255,255,0.45)", marginTop: 4 }}>Formerly {current.record.formerNames.join(", ")}</div>
+            )}
           </div>
 
           <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
@@ -404,11 +535,36 @@ const PolitiesPanel = ({
               type="button"
               style={pillButton(true)}
               onClick={() => onPaintPolity?.(current.key)}
-              title="Close this panel and start drag-painting this stable polity key across regions"
+              title="Close this panel and start drag-painting this polity across regions"
             >
               Paint this polity
             </button>
           </div>
+
+          <details style={{ border: "1px solid rgba(255,255,255,0.1)", borderRadius: 8, padding: "6px 9px" }}>
+            <summary style={{ cursor: "pointer", fontSize: 11.5, fontWeight: 700 }}>
+              Regions ({ownedRegions.length}){current.claimantCount ? ` · ${current.claimantCount} claimed` : ""}
+            </summary>
+            {ownedRegions.length === 0 ? (
+              <div style={{ fontSize: 10.8, color: "rgba(255,255,255,0.5)", marginTop: 6 }}>
+                No regions yet — this country is registered and ships to the game without land until it is painted or assigned some.
+              </div>
+            ) : (
+              <div style={{ display: "grid", gap: 3, marginTop: 6, maxHeight: 200, overflowY: "auto" }}>
+                {ownedRegions.map((region) => (
+                  <button
+                    key={region.id}
+                    type="button"
+                    onClick={() => { setSelection?.([region.id]); api?.zoomToRegion?.(region.id); }}
+                    title="Select this region and zoom to it"
+                    style={{ textAlign: "left", padding: "4px 7px", borderRadius: 6, border: "1px solid rgba(255,255,255,0.08)", background: "rgba(255,255,255,0.03)", color: "white", cursor: "pointer", fontSize: 11.5 }}
+                  >
+                    {region.name || region.id}
+                  </button>
+                ))}
+              </div>
+            )}
+          </details>
 
           <div>
             <div style={{ fontSize: 10.5, color: "rgba(255,255,255,0.48)", marginBottom: 4 }}>Transfer all territory from another polity</div>
@@ -453,22 +609,14 @@ const PolitiesPanel = ({
             </div>
           )}
 
-          {current.record && (
-            <button
-              type="button"
-              style={{ ...pillButton(false), color: canDeleteRecord ? "#f87171" : "rgba(255,255,255,0.35)" }}
-              disabled={!canDeleteRecord}
-              title={canDeleteRecord ? "Delete this landless polity record" : "Transfer/clear its territory and claims before deleting the polity record"}
-              onClick={() => {
-                if (!canDeleteRecord) return;
-                if (!window.confirm(`Delete the polity record “${current.name}”?`)) return;
-                removePolity?.(current.key);
-                setSelectedKey("");
-              }}
-            >
-              Delete polity record
-            </button>
-          )}
+          <button
+            type="button"
+            style={{ ...pillButton(false), color: "#f87171" }}
+            title="Make its regions unowned, drop the claims in its name, and remove the polity with its colour, flag and tags"
+            onClick={removeFromMap}
+          >
+            Remove from the map
+          </button>
         </div>
       )}
 
@@ -497,7 +645,7 @@ const PolitiesPanel = ({
 
         <div style={{ fontSize: 10.8, lineHeight: 1.45, color: "rgba(255,255,255,0.5)" }}>
           <b>Fill standard flags</b> stores Open Historia&apos;s built-in country flags in this scenario for safely recognized polities that are currently missing a flag; custom/historical flags are never overwritten. Roster import creates or updates polity records in bulk. Territory is untouched. Supports
-          <code> {"{ polities: [...] }"}</code>, a direct array, or an object keyed by stable polity key.
+          <code> {"{ polities: [...] }"}</code>, a direct array, or an object keyed by polity name.
         </div>
 
         {rosterPreview && (
@@ -528,12 +676,11 @@ const PolitiesPanel = ({
       </div>
 
       <div style={{ paddingTop: 8, borderTop: "1px solid rgba(255,255,255,0.1)" }}>
-        <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 6 }}>Create polity</div>
+        <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 6 }}>Create country</div>
         <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-          <input value={newName} onChange={(e) => setNewName(e.target.value)} placeholder="Display name, e.g. Austria-Hungary" style={inputStyle} />
-          <input value={newKey} onChange={(e) => setNewKey(e.target.value)} placeholder="Stable key (optional; defaults to display name)" style={inputStyle} />
-          <button type="button" style={pillButton(false)} disabled={!clean(newName || newKey)} onClick={createPolity}>
-            {selection.length ? `Create + assign ${selection.length} selected regions` : "Create landless polity"}
+          <input value={newName} onChange={(e) => setNewName(e.target.value)} placeholder="Name, e.g. Austria-Hungary" style={inputStyle} />
+          <button type="button" style={pillButton(false)} disabled={!clean(newName)} onClick={createPolity}>
+            {selection.length ? `Create country + assign ${selection.length} selected regions` : "Create country (no regions yet)"}
           </button>
         </div>
       </div>

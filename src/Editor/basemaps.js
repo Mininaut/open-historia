@@ -1,4 +1,4 @@
-/*! Open Historia Map Editor — ESRI basemap presets © 2026 Nicholas Krol, MIT (see src/Editor/LICENSE). */
+/*! Open Historia Map Editor — ESRI basemap presets © 2026 Nicholas Krol, AGPL-3.0-or-later (see LICENSE). */
 // ESRI / ArcGIS Online basemaps (public, token-free) shown behind the editor's
 // regions so you can see where you're drawing. Kept local to the editor so it
 // doesn't pull the game's runtime/assets.js (and its maplibre/pmtiles module
@@ -30,6 +30,18 @@ export const EDITOR_BASEMAPS = [
   { id: "terrain", label: "Terrain", service: "World_Terrain_Base", maxZoom: 13 },
   { id: "shaded", label: "Shaded Relief", service: "World_Shaded_Relief", maxZoom: 13 },
   { id: "natgeo", label: "National Geographic", service: "NatGeo_World_Map", maxZoom: 16 },
+  {
+    id: "natgeo-dark",
+    label: "National Geographic - Dark",
+    service: "NatGeo_World_Map",
+    maxZoom: 16,
+    // OpenLayers' built-in editor picker is raster-only. Give authors a faithful
+    // dark preview here; the game runtime swaps this id to the label-controlled
+    // vector style used for screenshots.
+    editorOpacity: 0.44,
+    editorBackground: "#111418",
+    previewFilter: "brightness(0.30) saturate(0.48) contrast(1.28)",
+  },
   { id: "physical", label: "Physical", service: "World_Physical_Map", maxZoom: 8 },
   { id: "light-gray", label: "Light Gray Canvas", service: "Canvas/World_Light_Gray_Base", maxZoom: 16 },
   { id: "dark-gray", label: "Dark Gray Canvas", service: "Canvas/World_Dark_Gray_Base", maxZoom: 16 },

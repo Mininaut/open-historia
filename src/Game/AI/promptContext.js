@@ -1,7 +1,7 @@
 import dayjs from "dayjs";
 import { JSON_URLS, getNationTags, loadRegionCatalog, readJson } from "../../runtime/assets.js";
 import { resolveAllCountryTags, resolveCountryTags } from "../../runtime/countryTags.js";
-import { toCountryName } from "../../runtime/ownerNames.js";
+import { buildOwnerAliasMap, canonicalOwnerName, toCountryName } from "../../runtime/ownerNames.js";
 import {
   buildActionDisplayText,
   haversineKm,
@@ -12,11 +12,13 @@ import {
   normalizeEvents,
   normalizeWorldState,
 } from "../../runtime/gameState.js";
-import { buildRegionOwnershipText } from "./regionVocab.js";
-import { isBetaUnits } from "../../runtime/mapSettings.js";
+import { buildRegionOwnershipText, regionOwnerName } from "./regionVocab.js";
+import { selectFocusPowers } from "./regionFocus.js";
+import { filterChatsVisibleTo } from "./chatVisibility.js";
 import { buildForcePostureText } from "./forcePosture.js";
 import { STALE_ROUNDS, describeTimeline, deriveProjectFlags, isPlayerProject } from "../../runtime/projects.js";
 import { buildTerritoryIndex } from "./territoryOutlines.js";
+import { compareGameDates, formatGameDateReadable } from "../../runtime/gameDates.js";
 
 const normalizeString = (value) => String(value ?? "").trim();
 const normalizeArray = (value) => (Array.isArray(value) ? value : []);
@@ -108,14 +110,23 @@ export const resolveHelperValues = (
   return resolved;
 };
 
+// The events a task is shown one by one: everything after the last summary's
+// boundary event. The log itself is never trimmed by consolidation — a summary
+// only moves this line.
 export const getUnconsolidatedEvents = (events, world) => {
   const normalizedEvents = normalizeEvents(events);
-  const history = normalizeWorldState(world).consolidatedHistory;
-  const throughEventId = history.at(-1)?.throughEventId;
+  const last = normalizeWorldState(world).consolidatedHistory.at(-1);
+  const throughEventId = last?.throughEventId;
   if (!throughEventId) return normalizedEvents;
 
   const boundaryIndex = normalizedEvents.findIndex((event) => event.id === throughEventId);
-  return boundaryIndex >= 0 ? normalizedEvents.slice(boundaryIndex + 1) : normalizedEvents;
+  if (boundaryIndex >= 0) return normalizedEvents.slice(boundaryIndex + 1);
+  // The boundary event is gone (deleted in the Event Editor). Showing the whole
+  // log again would put the summarised past back in every prompt and have the
+  // next pass fold it a second time; the summary's own date is the next best line.
+  const throughDate = normalizeString(last?.throughDate);
+  if (!throughDate) return normalizedEvents;
+  return normalizedEvents.filter((event) => !event.date || compareGameDates(event.date, throughDate) > 0);
 };
 
 // --- Context ranking (ported from the abdulrahman-2005 fork) ------------------
@@ -361,6 +372,34 @@ const joinConsolidatedCoverageWithinCharBudget = (rows, { maxChars = 0 } = {}) =
   return joinCoverageSelectedHistory(normalizedRows, selected);
 };
 
+// The living history document (historyConsolidation.js) is one text, so a task
+// whose budget is smaller than the document loses the document's OLDEST
+// paragraphs — never the whole thing, never a paragraph cut mid-sentence.
+const fitHistoryDocumentWithinCharBudget = (document, { maxChars = 0 } = {}) => {
+  const heading = `History document (maintained across consolidations${document.throughDate ? `, through ${document.throughDate}` : ""}):`;
+  const paragraphs = String(document.text ?? "")
+    .split(/\n\s*\n/)
+    .map((paragraph) => paragraph.trim())
+    .filter(Boolean);
+  const budget = Math.max(0, Math.trunc(Number(maxChars) || 0));
+  const full = [heading, ...paragraphs].join("\n\n");
+  if (!budget || full.length <= budget) return full;
+
+  const kept = [];
+  let used = heading.length;
+  for (const paragraph of [...paragraphs].reverse()) {
+    const next = paragraph.length + 2;
+    if (kept.length > 0 && used + next > budget) break;
+    kept.unshift(paragraph);
+    used += next;
+  }
+  const omitted = paragraphs.length - kept.length;
+  const marker = omitted > 0
+    ? [`[${omitted} older paragraph(s) of the history document omitted from this task context; the full document remains in the save.]`]
+    : [];
+  return [heading, ...marker, ...kept].join("\n\n");
+};
+
 export const buildConsolidatedHistoryText = (
   world,
   {
@@ -368,7 +407,13 @@ export const buildConsolidatedHistoryText = (
     selection = "tail",
   } = {},
 ) => {
-  const entries = normalizeWorldState(world).consolidatedHistory;
+  const normalizedWorld = normalizeWorldState(world);
+  // Once the document exists it IS the older history; the pass ledger behind
+  // it is bookkeeping, and rendering both would tell the story twice.
+  if (normalizedWorld.historyDocument?.text) {
+    return fitHistoryDocumentWithinCharBudget(normalizedWorld.historyDocument, { maxChars });
+  }
+  const entries = normalizedWorld.consolidatedHistory;
   if (entries.length === 0) return "No earlier campaign history has been consolidated yet.";
 
   const rendered = entries.map(renderConsolidatedHistoryEntry);
@@ -680,12 +725,18 @@ export const buildChatSummaryText = (chats, { limit = 4 } = {}) => {
   }).join("\n");
 };
 
-// `visibleTo` names the polity this transcript is rendered FOR; the caller has
-// already limited the chats to the ones that polity took part in
-// (chatVisibility.js). Distinct wording per case: "this polity has no
-// correspondence" is a very different fact from "nothing happened this round",
-// and a leader told the latter when the former is true may invent a
-// conversation to fill the gap.
+// `visibleTo` names the polity this transcript is rendered FOR, and limits it
+// to the chats that polity took part in (chatVisibility.js). buildPromptContext
+// applies the same filter to every chat-derived variable at once (promptChats
+// below), and the leader path filters upstream in main.jsx before the chats
+// reach buildPromptVariables at all - this is defence in depth, so a caller
+// that renders a transcript on its own still cannot leak one government's mail
+// to another. Blank means no restriction, which is what the narrator, the
+// consolidator and the advisor pass.
+//
+// Distinct wording per case: "this polity has no correspondence" is a very
+// different fact from "nothing happened this round", and a leader told the
+// latter when the former is true may invent a conversation to fill the gap.
 export const buildDetailedChatHistoryText = (
   chats,
   {
@@ -695,7 +746,13 @@ export const buildDetailedChatHistoryText = (
     visibleTo = "",
   } = {},
 ) => {
-  const normalizedChats = sortDiplomaticChatsByRecentActivity(chats);
+  // sortDiplomaticChatsByRecentActivity normalizes; filterChatsVisibleTo takes
+  // the chats as they come, so it goes on the outside and nothing is normalized
+  // twice.
+  const normalizedChats = filterChatsVisibleTo(
+    sortDiplomaticChatsByRecentActivity(chats),
+    visibleTo,
+  );
   if (normalizedChats.length === 0) {
     return visibleTo
       ? "You have exchanged no messages with them in these rounds."
@@ -837,6 +894,9 @@ export const formatActionsForPrompt = (actions) => normalizeArray(actions)
   .join("\n");
 
 export const formatDateReadable = (value) => {
+  // Any game date, BC spelled out ("1 March 218 BC"); dayjs for the rest.
+  const readable = formatGameDateReadable(value, "D MMMM YYYY");
+  if (readable) return readable;
   const parsed = dayjs(value);
   return parsed.isValid() ? parsed.format("D MMMM YYYY") : normalizeString(value);
 };
@@ -866,29 +926,9 @@ export const buildRecentRoundsWithDates = (bundle) => {
     .join("; ");
 };
 
-// Posture, composition and covert status are beta-system concepts. In the classic
-// system they are absent from play, so describing them would spend tokens on
-// mechanics the model cannot act on and invite ops the engine would discard.
-export const buildUnitsSummaryText = (world, { betaUnits = isBetaUnits() } = {}) => {
+export const buildUnitsSummaryText = (world) => {
   const units = normalizeArray(world?.units);
   if (units.length === 0) return "No military units are currently deployed on the map.";
-  if (!betaUnits) {
-    return units.slice(0, 60).map((unit) => {
-      const lat = Number(unit.lat);
-      const lng = Number(unit.lng);
-      const coords = Number.isFinite(lat) && Number.isFinite(lng)
-        ? `lat ${lat.toFixed(2)}, lng ${lng.toFixed(2)}`
-        : "unknown location";
-      const detail = [
-        `${unit.type}`,
-        `owner ${unit.ownerCode}`,
-        `${unit.strength}% of established strength`,
-        `status ${unit.status}`,
-      ].join(", ");
-      return `- ${unit.name} [id ${unit.id}] (${detail}) at ${coords}` +
-        `${unit.regionId ? `, region ${unit.regionId}` : ""}`;
-    }).join("\n");
-  }
   return units.slice(0, 60).map((unit) => {
     const lat = Number(unit.lat);
     const lng = Number(unit.lng);
@@ -949,7 +989,7 @@ const markerAttentionLimitForTask = (taskKey) => {
   if (["jumpForward", "autoJumpForward"].includes(key)) return 28;
   if (key === "gameMaster") return 40;
   if (key === "actions") return 20;
-  if (["catalystCreation", "catalystExecutor"].includes(key)) return 20;
+  if (["interactiveCreation", "interactiveExecutor"].includes(key)) return 20;
   return 16;
 };
 
@@ -1084,13 +1124,9 @@ export const buildMarkersSummaryText = (
 // every jump until the unit arrives or the order lapses. The model is shown these
 // as CONTEXT — advanceStandingOrders already moves them, so a move op for one of
 // these units would advance it twice (see the [Standing Unit Orders] directive).
-export const buildPendingUnitOrdersText = (world, { betaUnits = isBetaUnits() } = {}) => {
+export const buildPendingUnitOrdersText = (world) => {
   const orders = normalizeArray(world?.pendingUnitOrders);
-  // The classic system has no engine advancing orders, so there is nothing true
-  // to say here. A save may still CARRY dormant orders from beta play — they are
-  // preserved on disk deliberately, and describing them would invite the model to
-  // act on orders nothing is going to advance.
-  if (!betaUnits || orders.length === 0) {
+  if (orders.length === 0) {
     return "No units currently have a standing order.";
   }
   const unitById = new Map(normalizeArray(world?.units).map((unit) => [unit.id, unit]));
@@ -1398,16 +1434,100 @@ export const buildPlayerPolityRegionsText = async (bundle, regionCatalog = null)
   return names.join(", ");
 };
 
-export const buildWorldSummary = async (bundle, regionCatalog = null) => {
+const STOCK_REGION_ID = /^[A-Z]{3}\.\d+(?:_\d+)?$/;
+const isStockRegionId = (id) => STOCK_REGION_ID.test(String(id ?? ""));
+
+// A scenario that renders its own geometry shows the model ONLY the regions on
+// that map. loadRegionCatalog merges the stock GADM index with the scenario's
+// own regions; on a hand-drawn world the stock rows are not land here — the
+// fill paints them neutral and the transfer resolver ignores them — but they
+// still reached the prompt as province names and ids that exist nowhere, and
+// inflated every power's region count. Stock rows the world DOES list (a
+// hybrid map, a re-ownership preset) stay.
+export const filterToRenderedRegions = (regions, world) => {
+  const list = normalizeArray(regions);
+  if (!world?.customRegions) return list;
+  const overrides = world.regionOwnershipOverrides ?? {};
+  if (!list.some((region) => !isStockRegionId(region?.id))) return list;
+  return list.filter((region) => !isStockRegionId(region?.id) || overrides[String(region?.id)] !== undefined);
+};
+
+const recentEventList = (events, count = 12) => {
+  const list = Array.isArray(events) ? events : Object.values(events ?? {}).flat();
+  return list.filter((event) => event && typeof event === "object").slice(-count);
+};
+
+// The powers whose regions the prompt lists in full, most relevant first: the
+// player, the powers the player's pending actions name, the belligerents of
+// active wars, chat partners, the powers the recent events moved or mentioned,
+// claimants of contested land, then size (regionFocus.js). Declared scenario
+// actors that scored nothing are appended so a scripted power is never lost.
+export const rankFocusPowers = (regions, world, bundle, { playerName, actorNames = [], polityNames = {} } = {}) => {
+  const overrides = world.regionOwnershipOverrides ?? {};
+  const groups = new Map();
+  const ownerById = new Map();
+  for (const region of regions) {
+    const owner = regionOwnerName(region, overrides);
+    if (!owner) continue;
+    ownerById.set(String(region.id), owner);
+    const key = owner.toLowerCase();
+    const group = groups.get(key) ?? { key, label: owner, regions: 0 };
+    group.regions += 1;
+    groups.set(key, group);
+  }
+  const polityRecords = world.polityOverrides ?? {};
+  const owners = [...groups.values()].map((group) => {
+    const record = polityRecords[group.label]
+      ?? Object.values(polityRecords).find((entry) => normalizeString(entry?.name).toLowerCase() === group.key)
+      ?? null;
+    return {
+      ...group,
+      displayName: polityNames[group.key] || normalizeString(record?.name),
+      aliases: normalizeArray(record?.aliases),
+      stockName: toCountryName(normalizeString(record?.code)) || "",
+    };
+  });
+  const ranked = selectFocusPowers({
+    owners,
+    player: playerName,
+    actions: normalizeArray(bundle?.actions),
+    chats: normalizeArray(bundle?.chats),
+    events: recentEventList(bundle?.events),
+    wars: normalizeArray(world.wars),
+    claimants: world.regionClaimants ?? {},
+    ownerOfRegion: (regionId) => ownerById.get(String(regionId)) ?? "",
+  });
+  const labels = ranked.map((entry) => entry.label);
+  for (const name of actorNames) {
+    if (name && !labels.some((label) => label.toLowerCase() === name.toLowerCase())) labels.push(name);
+  }
+  return labels;
+};
+
+// `regionListsViaTools`: the task has the lookup functions (lookupTools.js),
+// so the summary names the powers with their region counts and leaves the
+// region names and ids to find_region / list_regions / map_around.
+export const buildWorldSummary = async (bundle, regionCatalog = null, { regionListsViaTools = false } = {}) => {
   const world = normalizeWorldState(bundle.world);
-  const regions = regionCatalog ?? await loadRegions();
+  const regions = filterToRenderedRegions(regionCatalog ?? await loadRegions(), world);
   const regionLookup = new Map(regions.map((region) => [region.id, region]));
-  const territoryEntries = Object.entries(world.regionOwnershipOverrides);
+  // Only overrides that CHANGE an owner are changes: on a hand-drawn world every
+  // region carries an override equal to its baked owner, and listing sixty of
+  // those as "territorial changes" was noise the model read as history. The
+  // baked name is read through the alias map: a renamed country's regions are
+  // overridden to its new name (polityRename.js), and that is not a transfer.
+  const bakedAliases = buildOwnerAliasMap(world.polityOverrides);
+  const territoryEntries = Object.entries(world.regionOwnershipOverrides).filter(([regionId, ownerCode]) => {
+    const baked = normalizeString(regionLookup.get(regionId)?.country);
+    if (!baked) return true;
+    return canonicalOwnerName(baked, bakedAliases).toLowerCase() !== canonicalOwnerName(ownerCode, bakedAliases).toLowerCase();
+  });
   const territorySummary = territoryEntries.length === 0
-    ? "No territorial overrides from the base scenario are currently recorded."
+    ? "No territorial changes from the base scenario are currently recorded."
     : territoryEntries.slice(0, 60).map(([regionId, ownerCode]) => {
       const region = regionLookup.get(regionId);
-      return `- ${region?.name || regionId}${region?.country ? ` (${region.country})` : ""} -> ${ownerCode}`;
+      const bakedOwner = region?.country ? canonicalOwnerName(region.country, bakedAliases) : "";
+      return `- ${region?.name || regionId}${bakedOwner ? ` (${bakedOwner})` : ""} -> ${ownerCode}`;
     }).join("\n");
   const polities = Object.values(world.polityOverrides);
   const politySummary = polities.length === 0
@@ -1449,13 +1569,7 @@ export const buildWorldSummary = async (bundle, regionCatalog = null) => {
   // so it matches "Spain" — otherwise that power silently drops out of the enumerated
   // section and the model is left inventing its region names again.
   const playerName = toCountryName(normalizeString(bundle.game.country));
-  const overrideOwnerNames = [...new Set(
-    territoryEntries.map(([, owner]) => toCountryName(normalizeString(owner))).filter(Boolean),
-  )];
   const actorNames = polities.map((entry) => toCountryName(normalizeString(entry?.code))).filter(Boolean);
-  const chatNames = normalizeArray(bundle.chats).flatMap((chat) =>
-    normalizeArray(chat?.countries).map((country) => toCountryName(normalizeString(country?.code))).filter(Boolean));
-  const focusCodes = [playerName, ...overrideOwnerNames, ...actorNames, ...chatNames].filter(Boolean);
   // Owner name -> display name for both sections: base country names from the catalog,
   // with dynamic polity overrides layered on top (a re-owned/renamed power wins).
   const polityNames = {};
@@ -1466,9 +1580,11 @@ export const buildWorldSummary = async (bundle, regionCatalog = null) => {
   for (const entry of polities) {
     if (entry?.code) polityNames[toCountryName(String(entry.code)).toLowerCase()] = entry.name || toCountryName(entry.code);
   }
+  const focusCodes = rankFocusPowers(regions, world, bundle, { playerName, actorNames, polityNames });
   const regionOwnershipCatalog = buildRegionOwnershipText(regions, world.regionOwnershipOverrides, {
     focusCodes,
     polityNames,
+    ...(regionListsViaTools ? { focusTotalCap: 0, rosterCap: 120 } : {}),
   });
 
   return [
@@ -1483,8 +1599,10 @@ export const buildWorldSummary = async (bundle, regionCatalog = null) => {
     "Territorial changes from the base scenario:",
     territorySummary,
     "",
-    "Map ownership (this IS the comma-separated region list referenced above — the "
-      + "region vocabulary for regionTransfers):",
+    regionListsViaTools
+      ? "Map ownership by power (region counts only; region names and ids come from the lookup functions find_region, list_regions and map_around):"
+      : "Map ownership (this IS the comma-separated region list referenced above — the "
+        + "region vocabulary for regionTransfers):",
     regionOwnershipCatalog,
     "",
     "Dynamic polity overrides:",
@@ -1495,9 +1613,9 @@ export const buildWorldSummary = async (bundle, regionCatalog = null) => {
       + "them via polityChanges when events genuinely reshape a country.",
     tagSummary,
     "",
-    world.activeCatalyst
-      ? `Active catalyst: ${world.activeCatalyst.title || "untitled"} - ${world.activeCatalyst.premise || world.activeCatalyst.opening || ""}`
-      : "No active catalyst scene.",
+    world.activeInteractive
+      ? `Interactive event in progress: ${world.activeInteractive.title || "untitled"} - ${world.activeInteractive.premise || world.activeInteractive.opening || ""}`
+      : "No interactive event in progress.",
   ].join("\n");
 };
 
@@ -1505,10 +1623,10 @@ export const buildPromptContext = async (bundle, {
   actionInput = "",
   actionsToConsolidate = "",
   advisorLimit = 18,
-  catalystChoice = "",
-  catalystHistory = "",
-  catalystOpening = "",
-  catalystPremise = "",
+  interactiveChoice = "",
+  interactiveHistory = "",
+  interactiveOpening = "",
+  interactivePremise = "",
   chat = null,
   chatHistoryLongMaxChars = 0,
   chatLimit = 8,
@@ -1530,6 +1648,9 @@ export const buildPromptContext = async (bundle, {
   gameMasterRequest = "",
   longEventHistoryMaxChars = 0,
   longEventLimit = 24,
+  // The task has the lookup functions: the prompt keeps the overview and the
+  // functions carry the detail (region lists, older events, full chats).
+  lookups = false,
   requiredKeys = null,
   respondingPolityName = "",
   targetDate = "",
@@ -1566,7 +1687,7 @@ export const buildPromptContext = async (bundle, {
 
   let worldSummary = "";
   if (wants("worldSummary", "worldSummaryNoCity")) {
-    worldSummary = await buildWorldSummary(bundle, regionCatalog);
+    worldSummary = await buildWorldSummary(bundle, regionCatalog, { regionListsViaTools: lookups });
   }
 
   if (wants("citiesSummary")) {
@@ -1642,8 +1763,10 @@ export const buildPromptContext = async (bundle, {
 
     if (wants("recentEventsLong")) {
       const campaignRecentEvents = buildEventHistoryText(bundle.events, { currentDate: bundle.game?.gameDate,
-        limit: longEventLimit,
-        maxChars: longEventHistoryMaxChars,
+        // With lookups, the last eight events in view and recent_events for
+        // the rest; a caller's own tighter cap still wins.
+        limit: lookups ? Math.min(longEventLimit, 8) : longEventLimit,
+        maxChars: lookups && !longEventHistoryMaxChars ? 3000 : longEventHistoryMaxChars,
         world: bundle.world,
       });
       result.recentEventsLong = [
@@ -1698,7 +1821,10 @@ export const buildPromptContext = async (bundle, {
     );
     const unconsolidatedChats = normalizeChats(bundle.chats)
       .filter((entry) => !consolidatedChatIds.has(entry.id));
-    promptChats = sortDiplomaticChatsByRecentActivity(unconsolidatedChats);
+    // Every chat-derived variable - chat, chatHistory, chatSummary,
+    // diplomaticContinuity, chatHistoryLong - comes from this one list, so the
+    // visibility rule is applied once, here, and they cannot disagree.
+    promptChats = filterChatsVisibleTo(sortDiplomaticChatsByRecentActivity(unconsolidatedChats), chatVisibleTo);
     currentChat = normalizedChat ?? promptChats[0] ?? null;
   }
 
@@ -1711,7 +1837,8 @@ export const buildPromptContext = async (bundle, {
   if (wants("chatHistoryLong")) {
     result.chatHistoryLong = buildDetailedChatHistoryText(promptChats, {
       limit: chatLimit,
-      maxChars: chatHistoryLongMaxChars,
+      // With lookups, a short view; chat_history has the transcripts.
+      maxChars: lookups && !chatHistoryLongMaxChars ? 1500 : chatHistoryLongMaxChars,
       visibleTo: chatVisibleTo,
     });
   }
@@ -1753,17 +1880,17 @@ export const buildPromptContext = async (bundle, {
   // not merely skip the obvious expensive builders while materializing every alias.
   put("actionInput", actionInput);
   put("actionsToConsolidate", actionsToConsolidate);
-  put("catalystChoice", catalystChoice);
-  put("catalystDate", date);
-  put("catalystHistory", catalystHistory);
-  put("catalystOpening", catalystOpening);
-  if (wants("catalystPercent")) {
-    result.catalystPercent =
-      normalizeArray(bundle.world?.activeCatalyst?.history).length > 0
-        ? `${Math.min(100, normalizeArray(bundle.world.activeCatalyst.history).length * 50)}%`
+  put("interactiveChoice", interactiveChoice);
+  put("interactiveDate", date);
+  put("interactiveHistory", interactiveHistory);
+  put("interactiveOpening", interactiveOpening);
+  if (wants("interactivePercent")) {
+    result.interactivePercent =
+      normalizeArray(bundle.world?.activeInteractive?.history).length > 0
+        ? `${Math.min(100, normalizeArray(bundle.world.activeInteractive.history).length * 50)}%`
         : "0%";
   }
-  put("catalystPremise", catalystPremise);
+  put("interactivePremise", interactivePremise);
   put("date", date);
   if (wants("dateReadable")) result.dateReadable = formatDateReadable(date);
   put("difficulty", bundle.game.difficulty || "standard");
@@ -1824,7 +1951,7 @@ export const buildPromptContext = async (bundle, {
   // thing in a prompt build (region geometry for every power fielding forces),
   // so it is built only when a task actually renders it.
   if (wants("forcePosture")) {
-    result.forcePosture = !isBetaUnits() ? "" : await (async () => {
+    result.forcePosture = await (async () => {
       const world = normalizeWorldState(bundle.world);
       const owners = [
         normalizeString(bundle.game?.country),

@@ -1,4 +1,4 @@
-/*! Open Historia — spycraft: intelligence stat, spies both ways, discovery, double agents, redaction © 2026 Nicholas Krol, MIT (see src/Editor/LICENSE). */
+/*! Open Historia — spycraft: intelligence stat, spies both ways, discovery, double agents, redaction © 2026 Nicholas Krol, AGPL-3.0-or-later (see LICENSE). */
 // Espionage runs in both directions. The player plants spies in other polities
 // and reads their private diplomacy; other polities plant spies in the player
 // and read theirs. Every spy can be discovered by the target's service, and a
@@ -25,6 +25,22 @@ const clamp01 = (n, lo = 0, hi = 1) => Math.max(lo, Math.min(hi, n));
 // "none": every country runs one, whether or not the AI has ever rated it.
 export const intelligenceOf = (world, polity) =>
   clampPct(world?.intelligence?.[String(polity ?? "").trim()], DEFAULT_INTELLIGENCE);
+
+// Whether anything has ever put a number on this service. intelligenceOf()
+// answers "ordinary" for an unrated one — right for the maths, wrong for the
+// question "does this polity still need its first reading".
+export const isIntelligenceRated = (world, polity) =>
+  Number.isFinite(Number(world?.intelligence?.[String(polity ?? "").trim()]));
+
+// A rating as the model wrote it -> what goes in the world, or null for junk.
+export const normalizeIntelligenceRating = (value) => {
+  // Only a number or a numeric string counts: Number([]) is 0 and Number(null)
+  // is 0, and neither is a rating the model gave.
+  if (typeof value !== "number" && typeof value !== "string") return null;
+  if (typeof value === "string" && value.trim() === "") return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? Math.max(0, Math.min(100, Math.round(n))) : null;
+};
 
 // FNV-1a over a string -> [0, 1). Stable, so a hidden word stays hidden between
 // renders, and a round's discoveries come out the same on every replay.
@@ -130,6 +146,21 @@ export const setCoverStory = (world, id, coverStory) => setStatus(world, id, { c
 // the whole turn. Returns the next spies list plus what was applied and what
 // was skipped, with the reason in the words the UI would have shown.
 export const SPY_OP_KINDS = ["deploy", "recall"];
+
+// One order as it is STORED on an event. It used to be read straight off the raw
+// event and never normalized, so it did not survive a save: the order applied
+// during the turn, and a campaign reloaded from events.json had no record that
+// the agent was ever ordered anywhere. The shape is what applySpyOps reads, so
+// a replay of the stored event does exactly what the live turn did.
+export const normalizeSpyOp = (entry) => {
+  if (!entry || typeof entry !== "object") return null;
+  const op = String(entry.op ?? "").trim().toLowerCase();
+  const target = String(entry.target ?? entry.country ?? entry.polity ?? "").trim();
+  if (!SPY_OP_KINDS.includes(op) || !target) return null;
+  const coverStory = String(entry.coverStory ?? "").trim();
+  const note = String(entry.note ?? "").trim();
+  return { op, target, ...(coverStory ? { coverStory } : {}), ...(note ? { note } : {}) };
+};
 
 export const applySpyOps = (world, ops, { date = "", playerPolity = "" } = {}) => {
   const owner = String(playerPolity ?? "").trim();
@@ -353,12 +384,16 @@ const normalizeExchange = (exchange, index, target) => {
   const counterpart = String(exchange?.counterpart ?? "").trim();
   const messages = (Array.isArray(exchange?.messages) ? exchange.messages : []).map(normalizeMessage).filter(Boolean);
   if (!counterpart || messages.length === 0) return null;
+  // A copy stolen in a turn carries the event it came with, and is shown when
+  // that event is revealed (runtime/unseenEvents.js).
+  const eventId = String(exchange?.eventId ?? "").trim();
   return {
     id: String(exchange?.id ?? "").trim() || `${target}:${index}:${counterpart}`.toLowerCase().replace(/\s+/g, "-"),
     counterpart,
     date: String(exchange?.date ?? "").trim(),
     subject: String(exchange?.subject ?? "").trim(),
     messages,
+    ...(eventId ? { eventId } : {}),
   };
 };
 

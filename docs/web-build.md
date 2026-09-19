@@ -2,7 +2,7 @@
 
 The web build is the browser-only edition of Open Historia served from the trusted central origin (openhistoria.com / the `/play/` site). It runs the **entire game client unchanged** with **zero server**: a `window.fetch` interceptor answers every same-origin `/api/*` call out of IndexedDB, heavy map tiles stream from a Cloudflare Worker proxy (or a hash-verified community node swarm), and optional magic-link/Google accounts sync your games as client-side-encrypted blobs. Everything in this page lives under `src/runtime/web/` and ships **only** in the web build — it is dynamically imported behind `import.meta.env.VITE_OH_WEB` so it is dead-code-eliminated from the local desktop/APK download, which keeps its real same-origin Express server.
 
-See also: [Server build](server-build.md) (the Express store this mirrors), [World state](world-state.md), [Assets & PMTiles](assets.md), [Scenario & game library](library.md), [Community hub](community-hub.md).
+See also: [Server build](server.md) (the Express store this mirrors), [World state](world-state.md), [Assets & PMTiles](assets-and-data.md), [Scenario & game library](runtime-services.md), [Community hub](runtime-services.md).
 
 ---
 
@@ -14,7 +14,8 @@ The whole web backend is behind one Vite mode flag. `.env.web` sets `VITE_OH_WEB
 |---|---|---|
 | Gate | `src/main.jsx:28` | `if (import.meta.env.VITE_OH_WEB)` dynamically `import("./runtime/web/index.js")`, calls `installWebBackend()`, then `mount()`s the React app. Non-web builds just `mount()`. |
 | Entry | `src/runtime/web/index.js` | `installWebBackend()` — seed → install interceptor → accounts/sync → home page. |
-| Content fetch | `src/runtime/assets.js:855` | For pmtiles, dynamically imports `web/contentTrust.js` and tries `fetchVerifiedBuffer(url)` (node swarm) before the origin. |
+| Content fetch | `src/runtime/assets.js` (`warmPmtilesArchive`) | For pmtiles, dynamically imports `web/contentTrust.js` and tries `fetchVerifiedBuffer(url)` (node swarm) before the origin; the origin's bytes are then held to the same signed manifest by `verifyOriginBuffer(url, buffer)`. A scenario's own archive skips both. |
+| Worker fetches | `src/runtime/assets.js` (`prepareWorkerFetchableUrl`) | Workers never see the `window.fetch` patch, so the scenario's regions GeoJSON reaches MapLibre's `custom-regions-source` and the cartography worker through a `blob:` copy (`Nations.jsx` via `useWorkerFetchableUrl`); the runtime URL stays the epoch/cache key. |
 
 `installWebBackend()` (`src/runtime/web/index.js`) runs, in order:
 

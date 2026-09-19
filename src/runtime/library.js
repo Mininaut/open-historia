@@ -1,4 +1,4 @@
-/*! Open Historia — portions (scenario-map editor seeding) © 2026 Nicholas Krol, MIT (see src/Editor/LICENSE). */
+/*! Open Historia — portions (scenario-map editor seeding) © 2026 Nicholas Krol, AGPL-3.0-or-later (see LICENSE). */
 import { useSyncExternalStore } from "react";
 import { announceGameOpening, setReadinessGame } from "./mapReadiness.js";
 import {
@@ -8,7 +8,7 @@ import {
   setRuntimeAssetEndpoints,
 } from "./assets.js";
 import { logDebugEvent, setDebugLogContext } from "./debugLog.js";
-import { applySaveBetaUnits } from "./mapSettings.js";
+import { setActiveFeatures } from "./gameFeatures.js";
 import { enqueueContentStrings } from "./translator.js";
 
 const LIBRARY_API_ROOT = "/api/library";
@@ -76,6 +76,10 @@ const syncLibraryRuntime = () => {
   // Before the UI re-renders for the new save, so the map's readiness marks
   // (mapReadiness.js) are stamped with the game they belong to.
   setReadinessGame(libraryState.activeGameId);
+  // The features this save plays with — its scenario's configuration under its
+  // own overrides — for the UI (useActiveFeatures) and the simulation
+  // (isActiveFeatureEnabled), without a library round trip.
+  setActiveFeatures(libraryState.runtimeScenario?.features, libraryState.activeGame?.features);
   setCountryNameResolver((name, code) =>
     resolveCountryNameOverride(libraryState.runtimeScenario?.countryNameOverrides, name, code),
   );
@@ -202,9 +206,6 @@ const applyLibraryCatalog = (catalog) => {
   // After setLibraryState, never before: syncLibraryRuntime() inside it is what
   // repoints JSON_URLS.game at the newly active save.
   if (activeGameChanged) {
-    loadActiveSaveBetaUnits().catch((error) => {
-      console.warn("Failed to read the save's unit-system setting:", error);
-    });
     // The map's world store (Map/useWorldState.js) bootstraps once and then
     // follows same-tab writes; a switch to another save is neither, so without
     // this it kept rendering the previous save's basemap, background and
@@ -220,37 +221,6 @@ const applyLibraryCatalog = (catalog) => {
   return libraryState;
 };
 
-// The beta unit system is stored per save, in game.json — see the block above
-// MAP_SETTING_KEYS.betaUnits in mapSettings.js for why. That file cannot read it
-// itself (the value arrives over fetch, and mapSettings.js is imported by modules
-// that must load without a save), so the load lives here, next to the only place
-// that knows when the active save changed.
-//
-// Guarded by the id it was started for: activating two saves in quick succession
-// leaves two reads in flight, and the slower one must not land its answer on the
-// campaign that is now open.
-let betaUnitsRequest = null;
-export const loadActiveSaveBetaUnits = async () => {
-  const gameId = libraryState.activeGameId;
-  if (!gameId) {
-    applySaveBetaUnits("", null);
-    return null;
-  }
-
-  betaUnitsRequest = (async () => {
-    // Not forced: the startup preload and every catalog refresh warm this URL,
-    // and the URL itself carries the runtime token, so switching saves is
-    // already a different key rather than a stale hit.
-    const game = await readJson(JSON_URLS.game, { defaultValue: {} }).catch(() => ({}));
-    return game?.betaUnits;
-  })();
-
-  const request = betaUnitsRequest;
-  const value = await request;
-  if (request !== betaUnitsRequest || libraryState.activeGameId !== gameId) return null;
-  applySaveBetaUnits(gameId, value);
-  return value ?? null;
-};
 
 export const getLibraryState = () => libraryState;
 
@@ -358,10 +328,12 @@ const toUploadBuffer = async (file) => {
 // Fetch a scenario's JSON asset (regions/cities geojson, colors). Returns null
 // when the scenario has no such asset (404) instead of throwing — callers treat
 // a missing asset as "use the default".
-export const downloadScenarioJsonAsset = async (scenarioId, assetKey) => {
+// `coarse` asks for the regions coarsened for a zoomed-out preview (the
+// country picker) instead of the full-resolution file: a few MB, not 221.
+export const downloadScenarioJsonAsset = async (scenarioId, assetKey, { coarse = false } = {}) => {
   try {
     const response = await fetch(
-      `${SCENARIOS_API_ROOT}/${encodeURIComponent(scenarioId)}/assets/${encodeURIComponent(assetKey)}`,
+      `${SCENARIOS_API_ROOT}/${encodeURIComponent(scenarioId)}/assets/${encodeURIComponent(assetKey)}${coarse ? "?coarse=1" : ""}`,
     );
     if (!response.ok) return null;
     return await response.json();
@@ -426,8 +398,10 @@ export const clearGameAsset = async (gameId, assetKey) => {
   return details;
 };
 
-export const exportScenarioBundle = async (scenarioId, mode = "light") =>
-  requestJson(`${SCENARIOS_API_ROOT}/${encodeURIComponent(scenarioId)}/export?mode=${encodeURIComponent(mode)}`);
+// Always the whole scenario: geometry, cities, basemap, flags, colours, tags
+// and any custom tile archive. There is no light export.
+export const exportScenarioBundle = async (scenarioId) =>
+  requestJson(`${SCENARIOS_API_ROOT}/${encodeURIComponent(scenarioId)}/export`);
 
 export const importScenarioBundle = async (bundle) => {
   const details = await requestJson(`${SCENARIOS_API_ROOT}/import`, {
@@ -448,6 +422,46 @@ export const updateScenarioFromBundle = async (scenarioId, bundle) => {
   });
   await refreshLibraryCatalog({ force: true });
   return details;
+};
+
+// One Game as a portable record. The zip that carries it is assembled by the
+// caller (src/runtime/gameZip.js) so the same code runs on desktop and on the web build.
+export const exportGameBundle = async (gameId) =>
+  requestJson(`${GAMES_API_ROOT}/${encodeURIComponent(gameId)}/export`);
+
+export const importGameBundle = async (bundle) => {
+  const details = await requestJson(`${GAMES_API_ROOT}/import`, {
+    body: bundle,
+    method: "POST",
+  });
+  await refreshLibraryCatalog({ force: true });
+  return details;
+};
+
+// Restore points move as TEXT, never through requestJson, and that is the whole
+// point of them having their own endpoint. A full snapshots file is ~21 MB;
+// JSON.parse on it costs ~80 MB of heap, and requestJson would parse it coming
+// in and stringify it going back out — twice, for a payload this side only ever
+// moves from one place to another. Straight to and from the zip instead.
+export const readGameSnapshotsText = async (gameId) => {
+  const response = await fetch(
+    `${GAMES_API_ROOT}/${encodeURIComponent(gameId)}/snapshots`,
+    { cache: "no-store" },
+  );
+  if (!response.ok) throw new Error(`Could not read this game's restore points (HTTP ${response.status}).`);
+  return response.text();
+};
+
+export const writeGameSnapshotsText = async (gameId, snapshotsText) => {
+  const response = await fetch(
+    `${GAMES_API_ROOT}/${encodeURIComponent(gameId)}/snapshots`,
+    {
+      body: snapshotsText,
+      headers: { "Content-Type": "application/json" },
+      method: "PUT",
+    },
+  );
+  if (!response.ok) throw new Error(`Could not restore this game's restore points (HTTP ${response.status}).`);
 };
 
 export const loadGameDetails = async (gameId) =>

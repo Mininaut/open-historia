@@ -1,6 +1,6 @@
 /*!
  * Open Historia Map Editor
- * Copyright (c) 2026 Nicholas Krol - MIT License (see src/Editor/LICENSE).
+ * Copyright (c) 2026 Nicholas Krol - AGPL-3.0-or-later (see LICENSE).
  */
 
 // The OpenLayers map surface for the editor. Created once and driven imperatively
@@ -32,8 +32,11 @@ import Modify from "ol/interaction/Modify";
 import Translate from "ol/interaction/Translate";
 import Snap from "ol/interaction/Snap";
 import PointerInteraction from "ol/interaction/Pointer";
+import DragBox from "ol/interaction/DragBox";
 import { fromExtent as polygonFromExtent } from "ol/geom/Polygon";
 import Feature from "ol/Feature";
+import { samePolityName } from "../../server/polityRename.js";
+import { BORDER_CLEANUP, bucketRegions, planTopologyChunks, yieldToBrowser } from "./topologySweep.js";
 import Collection from "ol/Collection";
 import GeoJSON from "ol/format/GeoJSON";
 import ImageLayer from "ol/layer/Image";
@@ -51,7 +54,9 @@ import {
   overlaps,
   planarGeometryArea,
   enclosedGapGeoms,
+  enclosedGapsOfUnion,
   overlapGeoms,
+  unionAllGeoms,
 } from "./geometry.js";
 
 const BASEMAP_BG = {
@@ -289,6 +294,66 @@ const cityStyle = (size, name) => {
   return style;
 };
 
+// A feature the Features panel has selected (box-select or a ticked row):
+// always drawn, ringed in yellow, labelled — so a selection reads on the map.
+const selectedCityStyleCache = new Map();
+const selectedCityStyle = (size, name) => {
+  const key = name ? `${size}|${name}` : size;
+  let style = selectedCityStyleCache.get(key);
+  if (!style) {
+    style = new Style({
+      image: new CircleStyle({
+        radius: size === "large" ? 9 : size === "mid" ? 7.5 : 6.5,
+        fill: new Fill({ color: "rgba(250,204,21,0.35)" }),
+        stroke: new Stroke({ color: "#facc15", width: 2.5 }),
+      }),
+      text: name
+        ? new Text({
+            text: name,
+            font: "700 11px sans-serif",
+            offsetY: -13,
+            fill: new Fill({ color: "#fef3c7" }),
+            stroke: new Stroke({ color: "rgba(0,0,0,0.9)", width: 3 }),
+          })
+        : undefined,
+    });
+    selectedCityStyleCache.set(key, style);
+  }
+  return style;
+};
+
+// A starting unit placed in the Workshop: a diamond in its owner's colour with
+// the type's initial; the name replaces the initial at closer zooms.
+const UNIT_GLYPH = { infantry: "I", armor: "A", air: "✈", naval: "N", artillery: "R", garrison: "G" };
+const unitStyleCache = new Map();
+const unitStyle = (feature, zoom, rgb) => {
+  const type = feature.get("type") || "infantry";
+  const name = zoom >= 4.5 ? feature.get("name") || "" : "";
+  const color = Array.isArray(rgb) && rgb.length >= 3 ? `rgb(${rgb.slice(0, 3).join(",")})` : "rgb(110,110,120)";
+  const key = `${type}|${color}|${name}`;
+  let style = unitStyleCache.get(key);
+  if (!style) {
+    style = new Style({
+      image: new RegularShape({
+        points: 4,
+        radius: 9,
+        angle: Math.PI / 4,
+        fill: new Fill({ color }),
+        stroke: new Stroke({ color: "rgba(0,0,0,0.9)", width: 1.5 }),
+      }),
+      text: new Text({
+        text: name ? `${UNIT_GLYPH[type] || "?"} ${name}` : UNIT_GLYPH[type] || "?",
+        font: "700 10.5px sans-serif",
+        offsetY: name ? -15 : 0,
+        fill: new Fill({ color: "#fff" }),
+        stroke: new Stroke({ color: "rgba(0,0,0,0.9)", width: 3 }),
+      }),
+    });
+    unitStyleCache.set(key, style);
+  }
+  return style;
+};
+
 // Same reasoning for region labels: the region styles are memoised (see
 // olStyle.js) and these were the one place still allocating per feature per
 // frame. Keyed on the text, the only thing that varies.
@@ -341,6 +406,12 @@ const OlMap = ({
   paintOwner = "",
   paintOnlyOwner = "*",
   features = [],
+  units = [],
+  featureSelectionIds = [],
+  onFeatureSelectionChange,
+  onUnitCreate,
+  onUnitEdit,
+  onUnitRemove,
   onSelectionChange,
   onRegionCount,
   onRegionsChanged,
@@ -365,6 +436,13 @@ const OlMap = ({
   const labelLayerRef = useRef(null);
   const pointSourceRef = useRef(null);
   const pointLayerRef = useRef(null);
+  const unitSourceRef = useRef(null);
+  const unitLayerRef = useRef(null);
+  const featureSelectionRef = useRef(new Set());
+  const onFeatureSelectionRef = useRef(onFeatureSelectionChange);
+  const onUnitCreateRef = useRef(onUnitCreate);
+  const onUnitEditRef = useRef(onUnitEdit);
+  const onUnitRemoveRef = useRef(onUnitRemove);
   const topologySourceRef = useRef(null);
   const topologyLayerRef = useRef(null);
   const importPreviewLayerRef = useRef(null);
@@ -395,6 +473,10 @@ const OlMap = ({
   onFeatureCreateRef.current = onFeatureCreate;
   const onFeatureEditRef = useRef(onFeatureEdit);
   onFeatureEditRef.current = onFeatureEdit;
+  onFeatureSelectionRef.current = onFeatureSelectionChange;
+  onUnitCreateRef.current = onUnitCreate;
+  onUnitEditRef.current = onUnitEdit;
+  onUnitRemoveRef.current = onUnitRemove;
   const onFeatureRemoveRef = useRef(onFeatureRemove);
   onFeatureRemoveRef.current = onFeatureRemove;
   const onHistoryRef = useRef(onHistory);
@@ -525,13 +607,26 @@ const OlMap = ({
         const tags = feature.get("tags") || [];
         const large = tags.includes("capital") || pop >= 1000000;
         const mid = pop >= 100000;
-        if (!(large || (mid && zoom >= 3.5) || zoom >= 5)) return null;
+        // A selected feature (the Features panel) always shows, highlighted.
+        const selected = featureSelectionRef.current.has(String(feature.getId()));
+        if (!selected && !(large || (mid && zoom >= 3.5) || zoom >= 5)) return null;
         const size = large ? "large" : mid ? "mid" : "small";
-        const showLabel = zoom >= 6 || (large && zoom >= 4.3) || (mid && zoom >= 5.3);
-        return cityStyle(size, showLabel ? feature.get("name") || "" : "");
+        const showLabel = selected || zoom >= 6 || (large && zoom >= 4.3) || (mid && zoom >= 5.3);
+        const name = showLabel ? feature.get("name") || "" : "";
+        return selected ? selectedCityStyle(size, name) : cityStyle(size, name);
       },
     });
     pointLayer.setZIndex(30);
+
+    // Starting units placed in the Workshop (world.units, source "scenario").
+    const unitSource = new VectorSource({ wrapX: false });
+    const unitLayer = new VectorLayer({
+      source: unitSource,
+      wrapX: false,
+      declutter: true,
+      style: (feature, resolution) => unitStyle(feature, getZoom(resolution), colorsRef.current?.[feature.get("ownerCode")]),
+    });
+    unitLayer.setZIndex(31);
 
     // Province-raster alignment preview. It is display-only and never becomes
     // part of the document. The importer swaps the source as the geographic
@@ -576,7 +671,7 @@ const OlMap = ({
     const map = new Map({
       target: containerRef.current,
       controls: defaultControls({ rotate: false }),
-      layers: [regionLayer, labelLayer, pointLayer, importPreviewLayer, paintPreviewLayer, topologyLayer, borderAssistLayer],
+      layers: [regionLayer, labelLayer, pointLayer, unitLayer, importPreviewLayer, paintPreviewLayer, topologyLayer, borderAssistLayer],
       view: new View({ center: fromLonLat([0, 20]), zoom: 2.1, minZoom: 1, maxZoom: 20 }),
     });
 
@@ -585,6 +680,8 @@ const OlMap = ({
     labelLayerRef.current = labelLayer;
     pointSourceRef.current = pointSource;
     pointLayerRef.current = pointLayer;
+    unitSourceRef.current = unitSource;
+    unitLayerRef.current = unitLayer;
     topologySourceRef.current = topologySource;
     topologyLayerRef.current = topologyLayer;
     importPreviewLayerRef.current = importPreviewLayer;
@@ -625,9 +722,23 @@ const OlMap = ({
       return point;
     };
 
+    // A placed unit under the cursor, for the Unit and Delete tools.
+    const unitAtPixel = (pixel, tolerance = 10) => {
+      let unit = null;
+      map.forEachFeatureAtPixel(
+        pixel,
+        (feature) => {
+          unit = feature;
+          return true;
+        },
+        { layerFilter: (l) => l === unitLayerRef.current, hitTolerance: tolerance },
+      );
+      return unit;
+    };
+
     map.on("singleclick", (evt) => {
       const tool = activeToolRef.current;
-      if (tool !== "select" && tool !== "delete" && tool !== "paint" && tool !== "feature" && tool !== "dissolve") return;
+      if (tool !== "select" && tool !== "delete" && tool !== "paint" && tool !== "feature" && tool !== "dissolve" && tool !== "unit") return;
       let hit = null;
       map.forEachFeatureAtPixel(
         evt.pixel,
@@ -638,7 +749,12 @@ const OlMap = ({
         { layerFilter: (l) => l === regionLayerRef.current, hitTolerance: 2 },
       );
       if (tool === "delete") {
-        // Deleting works on cities too — a point hit wins over the region under it.
+        // Deleting works on units and cities too — a point hit wins over the region under it.
+        const unitHit = unitAtPixel(evt.pixel);
+        if (unitHit) {
+          onUnitRemoveRef.current?.(unitHit.getId());
+          return;
+        }
         const point = pointAtPixel(evt.pixel);
         if (point) {
           onFeatureRemoveRef.current?.(point.getId());
@@ -650,6 +766,24 @@ const OlMap = ({
       if (tool === "paint") {
         // R2.7 paint is handled by a PointerInteraction so a click and a whole
         // drag stroke use the same one-operation Undo/Redo transaction.
+        return;
+      }
+      if (tool === "unit") {
+        // Clicking an existing unit edits it; clicking the map places a new one
+        // where the click landed, owned by the region under it.
+        const unitHit = unitAtPixel(evt.pixel);
+        if (unitHit) {
+          onUnitEditRef.current?.({ id: unitHit.getId(), pixel: [...evt.pixel] });
+          return;
+        }
+        const [lng, lat] = toLonLat(evt.coordinate);
+        onUnitCreateRef.current?.({
+          lng: Number(lng.toFixed(5)),
+          lat: Number(lat.toFixed(5)),
+          ownerCode: hit ? hit.get("owner") || "" : "",
+          regionId: hit ? hit.getId() : null,
+          pixel: [...evt.pixel],
+        });
         return;
       }
       if (tool === "feature") {
@@ -750,16 +884,16 @@ const OlMap = ({
         layerFilter: (l) => l === regionLayerRef.current,
       });
       const tool = activeToolRef.current;
-      if (tool === "lasso" || tool === "draw" || tool === "modify" || tool === "paint") {
+      if (tool === "lasso" || tool === "draw" || tool === "modify" || tool === "paint" || tool === "feature-box") {
         map.getTargetElement().style.cursor = "crosshair";
-      } else if (tool === "feature" || tool === "delete") {
+      } else if (tool === "feature" || tool === "delete" || tool === "unit") {
         // City-aware tools: pointer over an existing city (edit/remove target).
         const pointHit = map.hasFeatureAtPixel(evt.pixel, {
-          layerFilter: (l) => l === pointLayerRef.current,
+          layerFilter: (l) => l === pointLayerRef.current || l === unitLayerRef.current,
           hitTolerance: 8,
         });
         map.getTargetElement().style.cursor =
-          pointHit || (hit && tool === "delete") ? "pointer" : tool === "feature" ? "crosshair" : "";
+          pointHit || (hit && tool === "delete") ? "pointer" : tool === "feature" || tool === "unit" ? "crosshair" : "";
       } else {
         map.getTargetElement().style.cursor =
           hit && (tool === "select" || tool === "paint" || tool === "dissolve") ? "pointer" : "";
@@ -898,24 +1032,10 @@ const OlMap = ({
       topologyAnalysisRef.current = null;
     };
 
-    const analyzeTopology = (ids, { maxWidth = 500 } = {}) => {
-      const width = Math.max(1, Number(maxWidth) || 500);
-      const feats = (ids || []).map((id) => regionSource.getFeatureById(id)).filter(Boolean);
-      topologySource.clear();
-      if (feats.length < 2) {
-        const empty = { maxWidth: width, gaps: [], overlaps: [], selectionCount: feats.length };
-        topologyAnalysisRef.current = empty;
-        return empty;
-      }
-
-      const gaps = [];
-      const overlapsFound = [];
-      let serial = 0;
-
-      // R2.4 large-area acceleration. OpenLayers VectorSource already maintains
-      // a spatial index, so do not compare every selected region with every other
-      // selected region. This keeps the SAME conservative topology rules while
-      // allowing much larger country / empire / continental selections.
+    // The two conservative defect classes, shared by the Topology panel's
+    // selection pass (analyzeTopology) and the save-time sweep over every
+    // region (repairTopologyEverywhere): same rules, same order, same undo.
+    const topologyContext = (feats) => {
       const selectedSet = new Set(feats);
       const featureOrder = new globalThis.Map(feats.map((feature, index) => [feature, index]));
       const areaCache = new globalThis.Map();
@@ -924,11 +1044,18 @@ const OlMap = ({
         if (!areaCache.has(feature)) areaCache.set(feature, planarGeometryArea(feature.getGeometry()));
         return areaCache.get(feature);
       };
-      let spatialPairs = 0;
+      let serial = 0;
+      return { selectedSet, featureOrder, areaOf, nextId: () => ++serial };
+    };
 
-      // Fully enclosed holes in the selection union are the only gap class R2
-      // auto-fills. Open coastline defects are preview/manual territory for now.
-      for (const row of enclosedGapGeoms(feats.map((f) => f.getGeometry()), { maxWidth: width })) {
+    // Each enclosed hole becomes a gap filled into the neighbour whose boundary
+    // it touches most (the larger region on ties); a hole touching nothing is
+    // dropped. Neighbours come from the spatial index, limited to the pass's
+    // regions and sorted by their order so proposals are deterministic.
+    const assignGapTargets = (holes, width, { selectedSet, featureOrder, areaOf, nextId }) => {
+      const items = [];
+      const epsilon = Math.max(4, width * 0.08);
+      for (const row of holes) {
         const ext = expandExtent(row.geom.getExtent(), Math.max(4, width * 1.5));
         const neighbors = regionSource
           .getFeaturesInExtent(ext)
@@ -936,7 +1063,6 @@ const OlMap = ({
           .sort((a, b) => featureOrder.get(a) - featureOrder.get(b));
         let target = null;
         let bestScore = -1;
-        const epsilon = Math.max(4, width * 0.08);
         for (const f of neighbors) {
           const score = boundaryTouchScore(row.geom, f.getGeometry(), epsilon);
           if (score > bestScore || (score === bestScore && areaOf(f) > areaOf(target))) {
@@ -945,26 +1071,25 @@ const OlMap = ({
           }
         }
         if (!target || bestScore <= 0) continue;
-        const id = `gap-${++serial}`;
-        const item = {
-          id,
+        items.push({
+          id: `gap-${nextId()}`,
           kind: "gap",
           geom: row.geom.clone(),
           area: row.area,
           width: row.width,
           targetId: target.getId(),
           targetName: nameOf(target),
-        };
-        gaps.push(item);
-        const overlay = new Feature({ geometry: row.geom.clone(), kind: "gap" });
-        overlay.setId(`topology-${id}`);
-        topologySource.addFeature(overlay);
+        });
       }
+      return items;
+    };
 
-      // Pairwise narrow overlaps. R2.4 asks the VectorSource spatial index only
-      // for selected features whose extents can actually meet A. Sorting by the
-      // original selection order keeps repair proposals deterministic.
-      for (let i = 0; i < feats.length; i += 1) {
+    // Narrow overlaps between feats[from, to) and their later-ordered extent
+    // neighbours. R2.4: the VectorSource spatial index is asked only for the
+    // regions whose extents can actually meet A, never every pair.
+    const findNarrowOverlaps = (feats, width, { featureOrder, areaOf, nextId }, { from = 0, to = feats.length, onPair, minWidth = 0 } = {}) => {
+      const items = [];
+      for (let i = from; i < to; i += 1) {
         const a = feats[i];
         const aExtent = a.getGeometry().getExtent();
         const nearby = regionSource
@@ -974,10 +1099,10 @@ const OlMap = ({
           .sort((x, y) => x.index - y.index);
 
         for (const { feature: b } of nearby) {
-          spatialPairs += 1;
+          onPair?.();
           let pieces = [];
           try {
-            pieces = overlapGeoms(a.getGeometry(), b.getGeometry(), { maxWidth: width });
+            pieces = overlapGeoms(a.getGeometry(), b.getGeometry(), { maxWidth: width, minWidth });
           } catch (e) {
             console.warn("[editor] topology overlap analysis failed:", e);
             continue;
@@ -991,9 +1116,8 @@ const OlMap = ({
           const winner = aArea >= bArea ? a : b;
           const loser = winner === a ? b : a;
           for (const row of pieces) {
-            const id = `overlap-${++serial}`;
-            const item = {
-              id,
+            items.push({
+              id: `overlap-${nextId()}`,
               kind: "overlap",
               geom: row.geom.clone(),
               area: row.area,
@@ -1004,13 +1128,33 @@ const OlMap = ({
               bName: nameOf(b),
               winnerId: winner.getId(),
               loserId: loser.getId(),
-            };
-            overlapsFound.push(item);
-            const overlay = new Feature({ geometry: row.geom.clone(), kind: "overlap" });
-            overlay.setId(`topology-${id}`);
-            topologySource.addFeature(overlay);
+            });
           }
         }
+      }
+      return items;
+    };
+
+    const analyzeTopology = (ids, { maxWidth = 500 } = {}) => {
+      const width = Math.max(1, Number(maxWidth) || 500);
+      const feats = (ids || []).map((id) => regionSource.getFeatureById(id)).filter(Boolean);
+      topologySource.clear();
+      if (feats.length < 2) {
+        const empty = { maxWidth: width, gaps: [], overlaps: [], selectionCount: feats.length };
+        topologyAnalysisRef.current = empty;
+        return empty;
+      }
+
+      const context = topologyContext(feats);
+      let spatialPairs = 0;
+      // Fully enclosed holes in the selection union are the only gap class R2
+      // auto-fills. Open coastline defects are preview/manual territory for now.
+      const gaps = assignGapTargets(enclosedGapGeoms(feats.map((f) => f.getGeometry()), { maxWidth: width }), width, context);
+      const overlapsFound = findNarrowOverlaps(feats, width, context, { onPair: () => { spatialPairs += 1; } });
+      for (const item of [...gaps, ...overlapsFound]) {
+        const overlay = new Feature({ geometry: item.geom.clone(), kind: item.kind });
+        overlay.setId(`topology-${item.id}`);
+        topologySource.addFeature(overlay);
       }
 
       const report = {
@@ -1032,64 +1176,56 @@ const OlMap = ({
 
     analyzeTopologyRef.current = analyzeTopology;
 
-    const repairTopology = (ids, { maxWidth = 500 } = {}) => {
-      // Re-analyze at apply-time. The user may have edited a vertex after preview;
-      // stale geometry must never be committed blindly.
-      analyzeTopology(ids, { maxWidth });
-      const report = topologyAnalysisRef.current;
-      if (!report) return { changed: false, gaps: 0, overlaps: 0 };
-
+    // Committing repairs — overlaps first (the loser trimmed to the winner's
+    // boundary), then gaps (filled into their target) — as ONE undo step.
+    const beginTopologyEdit = () => {
       const before = new globalThis.Map();
       const remember = (f) => {
         if (!f || before.has(f.getId())) return;
         before.set(f.getId(), { feature: f, geometry: f.getGeometry().clone(), edited: f.get("edited") });
       };
-
-      let overlapRepairs = 0;
-      for (const item of report.overlaps || []) {
-        const winner = regionSource.getFeatureById(item.winnerId);
-        const loser = regionSource.getFeatureById(item.loserId);
-        if (!winner || !loser) continue;
-        remember(loser);
-        let after;
-        try {
-          after = subtractFrom(loser.getGeometry(), winner.getGeometry());
-        } catch (e) {
-          console.warn("[editor] topology overlap repair failed:", e);
-          continue;
-        }
-        if (!after) continue;
-        loser.setGeometry(after);
-        loser.set("edited", true);
-        overlapRepairs += 1;
+      return { before, remember };
+    };
+    const trimOverlap = (item, remember) => {
+      const winner = regionSource.getFeatureById(item.winnerId);
+      const loser = regionSource.getFeatureById(item.loserId);
+      if (!winner || !loser) return false;
+      remember(loser);
+      let after;
+      try {
+        after = subtractFrom(loser.getGeometry(), winner.getGeometry());
+      } catch (e) {
+        console.warn("[editor] topology overlap repair failed:", e);
+        return false;
       }
-
-      let gapRepairs = 0;
-      for (const item of report.gaps || []) {
-        const target = regionSource.getFeatureById(item.targetId);
-        if (!target) continue;
-        remember(target);
-        try {
-          const merged = unionGeoms([target.getGeometry(), item.geom]);
-          target.setGeometry(merged);
-          target.set("edited", true);
-          gapRepairs += 1;
-        } catch (e) {
-          console.warn("[editor] topology gap repair failed:", e);
-        }
+      if (!after) return false;
+      loser.setGeometry(after);
+      loser.set("edited", true);
+      return true;
+    };
+    const fillGap = (item, remember) => {
+      const target = regionSource.getFeatureById(item.targetId);
+      if (!target) return false;
+      remember(target);
+      try {
+        target.setGeometry(unionGeoms([target.getGeometry(), item.geom]));
+        target.set("edited", true);
+        return true;
+      } catch (e) {
+        console.warn("[editor] topology gap repair failed:", e);
+        return false;
       }
-
+    };
+    const finishTopologyEdit = ({ before }) => {
       if (!before.size) {
         clearTopologyDiagnostics();
-        return { changed: false, gaps: 0, overlaps: 0 };
+        return 0;
       }
-
       const after = new globalThis.Map();
       for (const [id, row] of before.entries()) {
         const f = regionSource.getFeatureById(id);
         if (f) after.set(id, { feature: f, geometry: f.getGeometry().clone(), edited: f.get("edited") });
       }
-
       const restore = (snapshot) => {
         for (const row of snapshot.values()) {
           row.feature.setGeometry(row.geometry.clone());
@@ -1099,7 +1235,6 @@ const OlMap = ({
         regionLayer.changed();
         labelLayer.changed();
       };
-
       pushCmd({
         undo: () => restore(before),
         redo: () => restore(after),
@@ -1108,7 +1243,142 @@ const OlMap = ({
       regionLayer.changed();
       labelLayer.changed();
       notifyRegions();
-      return { changed: true, gaps: gapRepairs, overlaps: overlapRepairs, affectedRegions: before.size };
+      return before.size;
+    };
+
+    const repairTopology = (ids, { maxWidth = 500 } = {}) => {
+      // Re-analyze at apply-time. The user may have edited a vertex after preview;
+      // stale geometry must never be committed blindly.
+      analyzeTopology(ids, { maxWidth });
+      const report = topologyAnalysisRef.current;
+      if (!report) return { changed: false, gaps: 0, overlaps: 0 };
+
+      const edit = beginTopologyEdit();
+      let overlapRepairs = 0;
+      for (const item of report.overlaps || []) {
+        if (trimOverlap(item, edit.remember)) overlapRepairs += 1;
+      }
+      let gapRepairs = 0;
+      for (const item of report.gaps || []) {
+        if (fillGap(item, edit.remember)) gapRepairs += 1;
+      }
+      const affectedRegions = finishTopologyEdit(edit);
+      if (!affectedRegions) return { changed: false, gaps: 0, overlaps: 0 };
+      return { changed: true, gaps: gapRepairs, overlaps: overlapRepairs, affectedRegions };
+    };
+
+    // Save-time border cleanup (MapEditor.jsx persistScenario): the panel's
+    // pass over EVERY region, repeated until a pass finds nothing (at most
+    // BORDER_CLEANUP.maxPasses — trimming a sliver can expose a hairline
+    // between the winner and a third region), all as ONE undo step. The gap
+    // search reads the holes of the union of the whole map — built as the
+    // union of chunk unions, the same polygon set as one call
+    // (topologySweep.js explains why a per-chunk search was rejected) with
+    // bounded memory and a repaint between chunks; overlaps go through the
+    // spatial index in batches. Defects narrower than minWidth are ignored:
+    // the save rounds coordinates to five decimals, about a metre, which
+    // leaves centimetre slivers along every repaired border that would be
+    // "repaired" again on every save. Repairs are applied in one go — a
+    // repaint between them redraws the whole world each time — and a thrown
+    // error leaves the caller to save the map as it is.
+    const repairTopologyEverywhere = async ({ maxWidth = BORDER_CLEANUP.maxWidth, onProgress } = {}) => {
+      const width = Math.max(1, Number(maxWidth) || BORDER_CLEANUP.maxWidth);
+      const floor = Math.min(width, BORDER_CLEANUP.minWidth);
+      const feats = regionSource.getFeatures().filter((f) => f.getGeometry?.());
+      const regionCount = feats.length;
+      const progress = {
+        phase: "gaps",
+        pass: 1,
+        maxPasses: BORDER_CLEANUP.maxPasses,
+        regionCount,
+        chunkIndex: 0,
+        chunkCount: 0,
+        gapsFound: 0,
+        regionsChecked: 0,
+        overlapsFound: 0,
+        repairsDone: 0,
+        repairCount: 0,
+        gapsFilled: 0,
+        overlapsTrimmed: 0,
+      };
+      const report = (patch) => {
+        Object.assign(progress, patch);
+        onProgress?.({ ...progress });
+      };
+      clearTopologyDiagnostics();
+      const totals = { gaps: 0, overlaps: 0, gapsFound: 0, overlapsFound: 0 };
+      let passes = 0;
+      if (regionCount < 2) {
+        report({ phase: "done" });
+        return { changed: false, gaps: 0, overlaps: 0, affectedRegions: 0, regionCount, gapsFound: 0, overlapsFound: 0, passes };
+      }
+      const edit = beginTopologyEdit();
+      const plan = planTopologyChunks(regionSource.getExtent(), regionCount);
+      while (passes < BORDER_CLEANUP.maxPasses) {
+        passes += 1;
+        report({ pass: passes, phase: "gaps", chunkIndex: 0, chunkCount: 0, gapsFound: 0, regionsChecked: 0, overlapsFound: 0, repairsDone: 0, repairCount: 0 });
+        // Areas change as regions are trimmed, so the context is rebuilt per pass.
+        const context = topologyContext(feats);
+
+        const buckets = bucketRegions(plan, feats, (f) => f.getGeometry().getExtent());
+        report({ chunkCount: buckets.length });
+        const partials = [];
+        for (let index = 0; index < buckets.length; index += 1) {
+          const unioned = unionAllGeoms(buckets[index].map((f) => f.getGeometry()));
+          if (unioned) partials.push(unioned);
+          report({ chunkIndex: index + 1 });
+          await yieldToBrowser();
+        }
+        const holes = enclosedGapsOfUnion(unionAllGeoms(partials), { maxWidth: width, minWidth: floor });
+        const gaps = assignGapTargets(holes, width, context);
+        report({ gapsFound: gaps.length });
+        await yieldToBrowser();
+
+        const overlapsFound = [];
+        report({ phase: "overlaps", regionsChecked: 0 });
+        for (let from = 0; from < regionCount; from += BORDER_CLEANUP.overlapBatch) {
+          const to = Math.min(regionCount, from + BORDER_CLEANUP.overlapBatch);
+          overlapsFound.push(...findNarrowOverlaps(feats, width, context, { from, to, minWidth: floor }));
+          report({ regionsChecked: to, overlapsFound: overlapsFound.length });
+          await yieldToBrowser();
+        }
+        totals.gapsFound += gaps.length;
+        totals.overlapsFound += overlapsFound.length;
+
+        const repairs = [
+          ...overlapsFound.map((item) => ({ kind: "overlap", item })),
+          ...gaps.map((item) => ({ kind: "gap", item })),
+        ];
+        report({ phase: "apply", repairCount: repairs.length, repairsDone: 0 });
+        if (!repairs.length) break;
+        await yieldToBrowser();
+        let gapsFilled = 0;
+        let overlapsTrimmed = 0;
+        for (const { kind, item } of repairs) {
+          if (kind === "overlap") {
+            if (trimOverlap(item, edit.remember)) overlapsTrimmed += 1;
+          } else if (fillGap(item, edit.remember)) {
+            gapsFilled += 1;
+          }
+        }
+        totals.gaps += gapsFilled;
+        totals.overlaps += overlapsTrimmed;
+        report({ repairsDone: repairs.length, gapsFilled: totals.gaps, overlapsTrimmed: totals.overlaps });
+        await yieldToBrowser();
+        if (!gapsFilled && !overlapsTrimmed) break;
+      }
+      const affectedRegions = finishTopologyEdit(edit);
+      report({ phase: "done" });
+      return {
+        changed: affectedRegions > 0,
+        gaps: totals.gaps,
+        overlaps: totals.overlaps,
+        affectedRegions,
+        regionCount,
+        gapsFound: totals.gapsFound,
+        overlapsFound: totals.overlapsFound,
+        passes,
+      };
     };
 
     const summarize = (f) => ({
@@ -1171,6 +1441,75 @@ const OlMap = ({
             }),
           });
         }
+      },
+      // Re-key an owner across the whole map (Polities panel rename): every
+      // region owned by, or claimed for, `from` now says `to`, as ONE undo step.
+      renameOwner: (from, to) => {
+        const same = (value) => samePolityName(value, from);
+        const undos = [];
+        for (const f of regionSource.getFeatures()) {
+          const owner = f.get("owner") || null;
+          const claimants = Array.isArray(f.get("claimants")) ? f.get("claimants") : [];
+          const ownerHit = Boolean(owner) && same(owner);
+          const claimHit = claimants.some(same);
+          if (!ownerHit && !claimHit) continue;
+          const before = { owner, claimants: claimants.length ? claimants.slice() : null };
+          const nextClaimants = claimHit ? [...new Set(claimants.map((claimant) => (same(claimant) ? to : claimant)))] : before.claimants;
+          const after = { owner: ownerHit ? to : owner, claimants: nextClaimants?.length ? nextClaimants : null };
+          f.set("owner", after.owner);
+          f.set("claimants", after.claimants);
+          undos.push([f, before, after]);
+        }
+        if (!undos.length) return 0;
+        const refresh = () => {
+          regionLayer.changed();
+          labelLayer.changed();
+          notifyRegions();
+        };
+        refresh();
+        pushCmd({
+          undo: () => { undos.forEach(([f, b]) => { f.set("owner", b.owner); f.set("claimants", b.claimants); }); refresh(); },
+          redo: () => { undos.forEach(([f, , a]) => { f.set("owner", a.owner); f.set("claimants", a.claimants); }); refresh(); },
+        });
+        return undos.length;
+      },
+      // Remove several owners from the map in one scan and one undo command.
+      // Owned regions become unowned and claims for those countries disappear.
+      removeOwners: (ownerKeys) => {
+        const keys = new Set((ownerKeys || []).map((key) => String(key || "").trim()).filter(Boolean));
+        if (!keys.size) return { affectedRegions: 0, ownedRegions: 0, claimRefs: 0 };
+        const undos = [];
+        let ownedRegions = 0;
+        let claimRefs = 0;
+        for (const f of regionSource.getFeatures()) {
+          const owner = f.get("owner") || null;
+          const claimants = Array.isArray(f.get("claimants")) ? f.get("claimants") : [];
+          const ownerHit = Boolean(owner) && keys.has(String(owner).trim());
+          const removedClaims = claimants.filter((claimant) => keys.has(String(claimant || "").trim()));
+          if (!ownerHit && !removedClaims.length) continue;
+          const before = { owner, claimants: claimants.length ? claimants.slice() : null };
+          const nextClaimants = removedClaims.length
+            ? claimants.filter((claimant) => !keys.has(String(claimant || "").trim()))
+            : claimants;
+          const after = { owner: ownerHit ? null : owner, claimants: nextClaimants.length ? nextClaimants : null };
+          f.set("owner", after.owner);
+          f.set("claimants", after.claimants);
+          if (ownerHit) ownedRegions += 1;
+          claimRefs += removedClaims.length;
+          undos.push([f, before, after]);
+        }
+        if (!undos.length) return { affectedRegions: 0, ownedRegions: 0, claimRefs: 0 };
+        const refresh = () => {
+          regionLayer.changed();
+          labelLayer.changed();
+          notifyRegions();
+        };
+        refresh();
+        pushCmd({
+          undo: () => { undos.forEach(([f, b]) => { f.set("owner", b.owner); f.set("claimants", b.claimants); }); refresh(); },
+          redo: () => { undos.forEach(([f, , a]) => { f.set("owner", a.owner); f.set("claimants", a.claimants); }); refresh(); },
+        });
+        return { affectedRegions: undos.length, ownedRegions, claimRefs };
       },
       deleteRegions: (ids) => {
         const removed = [];
@@ -1249,6 +1588,144 @@ const OlMap = ({
           });
         }
       },
+      // ---- the region clipboard (regionClipboard.js) -----------------------
+      // The selected regions as GeoJSON, ids in the properties like a saved
+      // map, so another map can paste them.
+      exportRegions: (ids) => {
+        const feats = (ids || []).map((id) => regionSource.getFeatureById(id)).filter(Boolean);
+        const fc = new GeoJSON().writeFeaturesObject(feats, {
+          dataProjection: "EPSG:4326",
+          featureProjection: "EPSG:3857",
+          decimals: 5,
+        });
+        for (const f of fc.features || []) {
+          if (f.id != null) f.properties = { ...(f.properties || {}), id: String(f.id) };
+        }
+        return fc;
+      },
+      // Paste regions copied from another map (or this one). Each pasted region
+      // takes its land OUT of whatever already covers it, exactly as the Draw
+      // tool does: a region beneath keeps what is not covered (a bite, or a
+      // hole), one covered entirely is removed. A pasted region keeps its id
+      // when this map has no region by that id (a stock-world id keeps its tile
+      // linkage), otherwise it gets a fresh one; it is always marked edited,
+      // since its shape is this map's own now whatever tiles it came from. The
+      // whole paste is one undo step.
+      pasteRegions: (fc, { select = true } = {}) => {
+        const incoming = fc && Array.isArray(fc.features)
+          ? new GeoJSON().readFeatures(fc, { dataProjection: "EPSG:4326", featureProjection: "EPSG:3857" })
+          : [];
+        const pasted = incoming.filter((f) => /Polygon$/.test(f.getGeometry()?.getType() || ""));
+        if (!pasted.length) return { added: [], trimmed: 0, removed: 0 };
+
+        // Carve first, against the map as it is; the pasted regions join the
+        // source afterwards, so they never cut each other. A region beneath
+        // several pasted ones is cut once per overlap and restored once on undo.
+        // A remainder thinner than a couple of metres end to end (2A/P) is
+        // rounding, not territory — both maps were saved at five decimals — so it
+        // counts as covered entirely rather than survive as a hairline ghost.
+        const hairline = (geom) => {
+          const polys = geom.getType() === "Polygon" ? [geom.getCoordinates()] : geom.getCoordinates();
+          let perimeter = 0;
+          for (const poly of polys) {
+            for (const ring of poly) {
+              for (let i = 1; i < ring.length; i += 1) {
+                perimeter += Math.hypot(ring[i][0] - ring[i - 1][0], ring[i][1] - ring[i - 1][1]);
+              }
+            }
+          }
+          return perimeter === 0 || (2 * geom.getArea()) / perimeter < 2;
+        };
+        const carved = new globalThis.Map();
+        for (const f of pasted) {
+          const cutter = f.getGeometry();
+          const candidates = [];
+          // A truthy return stops OpenLayers' extent walk, and push() returns the
+          // new length — so the block body, or each paste cuts one neighbour only.
+          regionSource.forEachFeatureIntersectingExtent(cutter.getExtent(), (other) => {
+            candidates.push(other);
+          });
+          for (const other of candidates) {
+            const geom = other.getGeometry();
+            if (!geom || !overlaps(geom, cutter)) continue;
+            const entry = carved.get(other) || {
+              feature: other,
+              before: geom.clone(),
+              after: null,
+              removed: false,
+              edited: other.get("edited"),
+            };
+            const after = subtractFrom(geom, cutter);
+            if (!after || hairline(after)) {
+              regionSource.removeFeature(other);
+              entry.after = null;
+              entry.removed = true;
+            } else {
+              other.setGeometry(after);
+              other.set("edited", true);
+              entry.after = after.clone();
+              entry.removed = false;
+            }
+            carved.set(other, entry);
+          }
+        }
+
+        const taken = new Set(regionSource.getFeatures().map((f) => String(f.getId())));
+        const added = [];
+        for (const f of pasted) {
+          const wanted = f.getId() != null ? String(f.getId()) : f.get("id") != null ? String(f.get("id")) : null;
+          let id = wanted && !taken.has(wanted) ? wanted : newId();
+          while (taken.has(id)) id = newId();
+          taken.add(id);
+          f.setId(id);
+          f.set("id", id);
+          if (f.get("typeId") == null) f.set("typeId", defaultTypeIdRef.current || "land");
+          if (f.get("owner") === undefined) f.set("owner", null);
+          if (!f.get("name")) f.set("name", "Region");
+          f.set("edited", true);
+          regionSource.addFeature(f);
+          added.push(f);
+        }
+
+        const entries = [...carved.values()];
+        const restore = (entry) => {
+          entry.feature.setGeometry(entry.before.clone());
+          if (entry.edited) entry.feature.set("edited", entry.edited);
+          else entry.feature.unset("edited");
+          if (entry.removed) regionSource.addFeature(entry.feature);
+        };
+        const reapply = (entry) => {
+          if (entry.removed) {
+            regionSource.removeFeature(entry.feature);
+          } else {
+            entry.feature.setGeometry(entry.after.clone());
+            entry.feature.set("edited", true);
+          }
+        };
+        regionLayer.changed();
+        labelLayer.changed();
+        if (select) onSelectionRef.current?.(added.map((f) => f.getId()));
+        notifyRegions();
+        pushCmd({
+          undo: () => {
+            added.forEach((f) => regionSource.removeFeature(f));
+            entries.forEach(restore);
+            regionLayer.changed();
+            labelLayer.changed();
+          },
+          redo: () => {
+            entries.forEach(reapply);
+            added.forEach((f) => regionSource.addFeature(f));
+            regionLayer.changed();
+            labelLayer.changed();
+          },
+        });
+        return {
+          added: added.map((f) => f.getId()),
+          trimmed: entries.filter((entry) => !entry.removed).length,
+          removed: entries.filter((entry) => entry.removed).length,
+        };
+      },
       getRegionSummary: (id) => {
         const f = regionSource.getFeatureById(id);
         return f ? summarize(f) : null;
@@ -1302,6 +1779,15 @@ const OlMap = ({
         }
         return ids;
       },
+      // The regions a polity owns, by name, for the Countries panel's list.
+      listOwnerRegions: (ownerKey) => {
+        const key = String(ownerKey || "").trim();
+        if (!key) return [];
+        return regionSource.getFeatures()
+          .filter((f) => String(f.get("owner") || "").trim() === key)
+          .map((f) => ({ id: f.getId(), name: String(f.get("name") || "").trim(), typeId: f.get("typeId") || "land" }))
+          .sort((a, b) => (a.name || String(a.id)).localeCompare(b.name || String(b.id)));
+      },
       queryRegions: (text, limit = 200) => {
         const q = (text || "").trim().toLowerCase();
         const out = [];
@@ -1334,6 +1820,7 @@ const OlMap = ({
       },
       analyzeTopology,
       repairTopology,
+      repairTopologyEverywhere,
       clearTopologyDiagnostics,
 
       // Province Map Importer preview. Bounds arrive as WGS84 lon/lat and are
@@ -2018,6 +2505,22 @@ const OlMap = ({
       const draw = new Draw({ type: "Polygon", features: new Collection(), freehand: true });
       draw.on("drawend", (e) => selectWithinPolygon(e.feature.getGeometry()));
       added.push(draw);
+    } else if (activeTool === "feature-box") {
+      // Hold the mouse down and drag a rectangle: every city/feature inside it
+      // is selected (shift-drag adds to the selection). The Features panel then
+      // tags or deletes them together.
+      const box = new DragBox();
+      box.on("boxend", (e) => {
+        const extent = box.getGeometry().getExtent();
+        const ids = [];
+        pointSourceRef.current?.forEachFeatureInExtent(extent, (f) => {
+          ids.push(String(f.getId()));
+        });
+        const additive = Boolean(e?.mapBrowserEvent?.originalEvent?.shiftKey);
+        const next = additive ? [...new Set([...featureSelectionRef.current, ...ids])] : ids;
+        onFeatureSelectionRef.current?.(next);
+      });
+      added.push(box);
     }
 
     added.forEach((i) => {
@@ -2066,6 +2569,33 @@ const OlMap = ({
       src.addFeature(feat);
     }
   }, [features]);
+
+  // Rebuild the unit layer whenever the units list changes; recolour it when the
+  // palette does (an owner's colour is read at draw time).
+  useEffect(() => {
+    const src = unitSourceRef.current;
+    if (!src) return;
+    src.clear();
+    for (const u of units) {
+      const lng = Number(u?.lng);
+      const lat = Number(u?.lat);
+      if (!Number.isFinite(lng) || !Number.isFinite(lat)) continue;
+      const feat = new Feature({ geometry: new Point(fromLonLat([lng, lat])) });
+      feat.setId(u.id);
+      feat.setProperties({ name: u.name, type: u.type, ownerCode: u.ownerCode, strength: u.strength });
+      src.addFeature(feat);
+    }
+  }, [units]);
+  useEffect(() => {
+    unitLayerRef.current?.changed();
+  }, [colors]);
+
+  // Selected features (the Features panel's box-select or ticked rows) draw
+  // highlighted, and always, whatever the zoom.
+  useEffect(() => {
+    featureSelectionRef.current = new Set((featureSelectionIds || []).map(String));
+    pointLayerRef.current?.changed();
+  }, [featureSelectionIds]);
 
   useEffect(() => {
     const map = mapRef.current;

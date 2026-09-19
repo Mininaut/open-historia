@@ -1,4 +1,4 @@
-/*! Open Historia — region vocabulary tests © 2026 Nicholas Krol, MIT (see src/Editor/LICENSE). */
+/*! Open Historia — region vocabulary tests © 2026 Nicholas Krol, AGPL-3.0-or-later (see LICENSE). */
 // Run: node --test src/Game/AI/regionVocab.test.js
 
 import test from "node:test";
@@ -321,4 +321,12 @@ test("F11 same content, different call → structurally identical (no hidden sta
 test("F12 non-array focusCodes is treated as empty (no throw)", () => {
   const text = buildRegionOwnershipText(CATALOG, {}, { focusCodes: "France" });
   assert.ok(!text.includes(FOCUS_INTRO));
+});
+
+test("with the region lists behind lookups, the vocabulary is powers and counts only", () => {
+  const text = buildRegionOwnershipText(CATALOG, {}, { focusCodes: ["france"], focusTotalCap: 0 });
+  assert.equal(text.includes(FOCUS_INTRO), false, "no region list at all");
+  assert.equal(text.includes(ROSTER_INTRO), true);
+  assert.match(text, /- France — \d+ regions?/);
+  assert.equal(/Bourgogne/.test(text), false, "no region names");
 });

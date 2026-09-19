@@ -1174,7 +1174,87 @@ const shouldCurateMode = (mode) =>
 
 // ---- main curator -----------------------------------------------------------
 
-export const curateGeneratedEvents = async ({
+// Drop routes that decide only whether a Canonical event is WORTH SHOWING. An
+// event removed by one of these still happened, so it is handed on as a Hidden
+// event: the Board reads every Canonical event, and routine progress on a Board
+// entry is exactly what these routes keep off the timeline.
+//
+// An allowlist on purpose. EXACT_DUPLICATE (it is already in the batch or the
+// log) and UNSUPPORTED_REVERSAL (it contradicts history, so it never happened)
+// are withheld, and so is any route added later until someone decides which kind
+// it is — the safe default for a Board that must never record a contradiction.
+const VISIBILITY_ROUTES = new Set([
+  "EVIDENCED_REDUNDANCY",
+  "RETRIEVAL_ASSISTED_REDUNDANCY",
+  "NATIVE_PROCESS_FILLER",
+  "LOW_VALUE_INCREMENTAL_CHURN",
+  "ROUTINE_MILITARY_NO_DELTA",
+  "SATURATED_ROUTINE_MILITARY_CHURN",
+  "SATURATED_INCREMENTAL_REDUNDANCY",
+]);
+
+// ---- is a judgment worth asking for? ----------------------------------------
+//
+// The analyst is a model request, and on a free key requests are what run out
+// (requestBudget.js). Whether it can change anything is knowable beforehand:
+// every route above that removes an event has a condition this file checks by
+// itself, without the analyst, and a candidate that meets none of them is kept
+// whatever the analyst says.
+//
+//   - an event with a hard mechanical consequence is always kept;
+//   - every redundancy and reversal route needs retrieved prior history above
+//     the similarity floors (groundedEvidencePass counts only priors the
+//     retriever also found, so it cannot pass where retrievalEvidencePass fails);
+//   - the routine-military routes need the routine cue without a concrete
+//     consequence;
+//   - process filler needs a process frame.
+//
+// Two model-only openings are given up when nothing else asks for a review: a
+// process frame the native cue does not recognise, and low-value churn on a
+// storyline the retriever finds nothing similar to. Both are rare, both fail
+// toward KEEP, and an exact duplicate is still removed without any analyst.
+//
+// Returns the indexes worth a judgment; empty means the analyst can be skipped.
+export const candidatesWorthJudging = ({ events = [], priorEvents = [], mode = "jump" } = {}) => {
+  if (!shouldCurateMode(mode)) return [];
+
+  const worth = [];
+  asArray(events).forEach((event, index) => {
+    if (structuredImpactReasons(event).length) return;
+
+    const priorMatches = retrievePriorMatches(event, priorEvents);
+    // Already decided without anyone's opinion.
+    if (deterministicNearDuplicate(event, priorMatches).duplicate) return;
+
+    const strong = priorMatches.filter((match) => match.similarity >= CONFIG.groundedStrongSimilarity).length;
+    const moderate = priorMatches.filter((match) => match.similarity >= CONFIG.groundedModerateSimilarity).length;
+    const resemblesHistory = strong >= 1 || moderate >= CONFIG.groundedModerateCount;
+    const routineMilitary = hasRoutineMilitaryContinuationCue(event) && !hasStrongMilitaryConsequenceCue(event);
+
+    if (resemblesHistory || routineMilitary || hasNativeProcessFrameCue(event)) worth.push(index);
+  });
+  return worth;
+};
+
+// What the analyst is shown, or null when there is nothing to show. Its own
+// function so the turn review (gameplay.js runTurnReview) can ask for the
+// judgments as one job among several, with exactly this input.
+export const buildCuratorInput = ({ events = [], priorEvents = [], mode = "jump" } = {}) => {
+  const incoming = asArray(events);
+  if (!shouldCurateMode(mode) || !incoming.length) return null;
+  return {
+    candidates: incoming.map(buildCandidatePacket),
+    priorHistory: buildPriorHistoryPacket(priorEvents),
+  };
+};
+
+// The timeline, as before.
+export const curateGeneratedEvents = async (args = {}) =>
+  (await curateGeneratedEventsWithHidden(args)).events;
+
+// The timeline plus the Hidden events it left out: { events, hidden }, where each
+// hidden row is { event, route, reason }.
+export const curateGeneratedEventsWithHidden = async ({
   events = [],
   priorEvents = [],
   game = {},
@@ -1186,7 +1266,7 @@ export const curateGeneratedEvents = async ({
   const incoming = asArray(events);
 
   if (!shouldCurateMode(mode)) {
-    return incoming;
+    return { events: incoming, hidden: [], dropped: [] };
   }
 
   const eventSummaries =
@@ -1201,17 +1281,9 @@ export const curateGeneratedEvents = async ({
   ) {
     try {
       analysisResult =
-        await analyzeBatch({
-          candidates:
-            incoming.map(
-              buildCandidatePacket,
-            ),
-
-          priorHistory:
-            buildPriorHistoryPacket(
-              priorEvents,
-            ),
-        });
+        await analyzeBatch(
+          buildCuratorInput({ events: incoming, priorEvents, mode }),
+        );
     } catch (error) {
       analysisError =
         normalizeString(
@@ -1522,8 +1594,24 @@ droppedCount:
     if (analysisError) console.warn(`[OH Native Timeline Curator] analyst error: ${analysisError}`);
   }
 
+  const hidden = evaluations
+    .filter((entry) => entry.wouldAction === "DROP" && VISIBILITY_ROUTES.has(entry.route))
+    .map((entry) => ({ event: entry.event, route: entry.route, reason: entry.enforcementReason }));
+
+  // Every event this pass removed, whichever kind of route removed it: `hidden`
+  // above is only the canonical ones the Board still reads. The turn's
+  // application receipt (runtime/applicationReceipt.js) tells the simulator about
+  // all of them, because none of them is in the record it is shown next turn.
+  const dropped = evaluations
+    .filter((entry) => entry.wouldAction === "DROP")
+    .map((entry) => ({
+      title: normalizeString(entry.event?.title),
+      route: entry.route,
+      reason: entry.enforcementReason,
+    }));
+
   // alright, no more training wheels.
-return keptEvents;
+  return { events: keptEvents, hidden, dropped };
 };
 
 export const getLastNativeCuratorAudit =

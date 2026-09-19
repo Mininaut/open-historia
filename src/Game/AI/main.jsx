@@ -1,17 +1,30 @@
-/*! Open Historia — portions (server relay for OpenAI-style APIs + reasoning toggle) © 2026 Nicholas Krol, MIT (see src/Editor/LICENSE). */
+/*! Open Historia — portions (server relay for OpenAI-style APIs + reasoning toggle) © 2026 Nicholas Krol, AGPL-3.0-or-later (see LICENSE). */
 import {
-    getModelForTask,
-    getProviderField,
-    getProviderSettings,
+    fallbackStateStore,
+    getEntryStatus,
+    getRateLimitPolicy,
     getReasoningEnabled,
-    getStoredProvider,
+    getResolvedFallbackList,
+    getTaskPick,
     providerSupportsModelDiscovery,
     saveRecentModel,
-    setProviderField,
+    updateEntry,
 } from "./providerConfig.js";
 import { OPENCODE_ZEN_ENDPOINT, pickZenFreeModel, validateZenModel, zenChatModels } from "./openCodeZen.js";
+import { formatResetTime, runWithFallback } from "./fallbackRunner.js";
+import { BACKGROUND_REQUEST, PLAYER_REQUEST, requestLedger } from "./requestBudget.js";
+import {
+    DEFAULT_ANSWER_RESERVE_TOKENS,
+    contextWindowKey,
+    createContextWindowMemory,
+    estimateTokens,
+    nothingFitsMessage,
+    parseContextWindowError,
+    requestChars,
+} from "./contextWindow.js";
 import { splitSystemPromptForCache } from "./promptLayout.js";
-import { attachCallMetrics, finishAiRecord, isTelemetryEnabled, startAiRecord } from "./telemetry.js";
+import { looksLikeModelFilePath, resolveServedModelId } from "./modelIds.js";
+import { attachLookupRound, attachCallMetrics, finishAiRecord, isTelemetryEnabled, startAiRecord  } from "./telemetry.js";
 import { JSON_URLS, readJson } from "../../runtime/assets.js";
 import { logDebugEvent } from "../../runtime/debugLog.js";
 import {
@@ -23,32 +36,55 @@ import {
 } from "../../runtime/diplomaticEnvelope.js";
 import { chatLanguageDirective, languageDirective } from "../../runtime/i18n.js";
 import { difficultyDirective } from "../../runtime/difficulty.js";
-import { isBetaUnits } from "../../runtime/mapSettings.js";
 import { normalizePromptPack } from "./gameplayPrompts.js";
 import {
     busyProviderMessage,
+    classifyProviderFailure,
+    contextWindowMessage,
+    describeHtmlErrorPage,
     errorPayloadText,
     isBusyErrorPayload,
-    isQuotaExhaustedPayload,
-    TOOL_CALL_INSISTENCE,
+    isContextWindowErrorPayload,
+    isContextWindowErrorText,
     isStreamingRefusal,
     isStreamingRequired,
     looksLikeDeliberation,
     providerErrorReplyMessage,
-    retryDelayMsFromPayload,
+    shouldRetryProviderFailure,
+    TOOL_CALL_INSISTENCE,
+    toolStreamRefusalError,
 } from "./providerErrors.js";
 import { ANSWER_SENTINEL_DIRECTIVE } from "./jsonSalvage.js";
 import { createModeObserver, nextStructuredMode, startingStructuredMode } from "./structuredMode.js";
-import { createFirstByteTimer, normalizeUsage } from "./usageStats.js";
+import { createFirstByteTimer, normalizeUsage, sumUsage } from "./usageStats.js";
 import { toGeminiSchema } from "./geminiSchema.js";
 import { readAnthropicStreamedResponse, readGeminiStreamedResponse, readOpenAIStreamedResponse } from "./streamAssembly.js";
+import {
+    anthropicMessagesFromHistory,
+    appendLookupRound,
+    describeLookupCall,
+    geminiContentsFromHistory,
+    lookupCallsFromAnthropic,
+    lookupCallsFromGemini,
+    lookupCallsFromOpenAI,
+    lookupRoundCount,
+    openAiMessagesFromHistory,
+} from "./toolTurns.js";
 import {
     buildPromptContext,
     formatDateReadable,
     renderTemplate,
     resolveHelperValues,
 } from "./promptContext.js";
+import { collapseRepeatedWorldContext } from "./promptDedupe.js";
+import { filterChatsVisibleTo, isChatVisibleTo } from "./chatVisibility.js";
 import { foreignAgentBrief } from "../../runtime/spycraft.js";
+import { renderReminders } from "../../runtime/gmChanges.js";
+import { describeGoalForAdvisor, playerGoalOf } from "../../runtime/playerGoal.js";
+import { describeReportsForPrompt, normalizeReports } from "../../runtime/reports.js";
+import { describeDocumentsForAdvisor } from "../../runtime/reportDelivery.js";
+import { viewAsSeen } from "../../runtime/gameState.js";
+import { withCatchUp } from "./conversationCatchUp.js";
 
 // main.jsx - AI chat module
 // Supports Gemini, OpenAI, Anthropic, and OpenAI-compatible endpoints
@@ -56,6 +92,16 @@ import { foreignAgentBrief } from "../../runtime/spycraft.js";
 
 const GEMINI_DEFAULT_MODEL = "gemini-3.5-flash-lite";
 const ANTHROPIC_DEFAULT_MODEL = "claude-haiku-4-5";
+
+// What each model has said about its context window (contextWindow.js), kept
+// with the other AI settings. Storage is reached at every call rather than
+// once: the harness installs its localStorage after this module has loaded,
+// and a browser that refuses storage simply forgets between sessions.
+export const contextWindows = createContextWindowMemory({
+    getItem: (key) => { try { return localStorage.getItem(key); } catch { return null; } },
+    setItem: (key, value) => { try { localStorage.setItem(key, value); } catch { /* this session only */ } },
+    removeItem: (key) => { try { localStorage.removeItem(key); } catch { /* nothing to forget */ } },
+});
 const OPENAI_API_ENDPOINT = "https://api.openai.com/v1";
 const ANTHROPIC_API_ENDPOINT = "https://api.anthropic.com/v1";
 
@@ -123,11 +169,27 @@ async function readErrorPayload(response) {
 
 function extractErrorMessage(payload, fallback) {
     if (!payload) return fallback;
-    if (typeof payload === "string" && payload.trim()) return payload.trim();
+    if (typeof payload === "string" && payload.trim()) return describeHtmlErrorPage(payload, fallback) || payload.trim();
     if (payload.error?.message) return payload.error.message;
     if (payload.message) return payload.message;
-    if (typeof payload.rawText === "string" && payload.rawText.trim()) return payload.rawText.trim();
+    if (typeof payload.rawText === "string" && payload.rawText.trim()) {
+        return describeHtmlErrorPage(payload.rawText, fallback) || payload.rawText.trim();
+    }
     return fallback;
+}
+
+// The body of a reply that claimed success. A 200 carrying a web page (a gateway
+// landing page, a proxy's error screen) used to surface as JSON.parse's
+// "Unexpected token '<', "<!doctype "... is not valid JSON" — true, and no help.
+async function readJsonAnswer(response, providerLabel) {
+    const text = await response.text();
+    try {
+        return JSON.parse(text);
+    } catch (error) {
+        const page = describeHtmlErrorPage(text, `${providerLabel} request failed (${response.status})`);
+        if (page) throw new Error(page);
+        throw error;
+    }
 }
 
 // Settings (per provider): an escape hatch for request-body fields the built-in
@@ -265,6 +327,23 @@ function getGeminiStreamUrl(model, apiKey) {
     return getGeminiUrl(model, apiKey).replace(":generateContent?", ":streamGenerateContent?alt=sse&");
 }
 
+// Why a Gemini skip's events arrive together while every other provider's arrive
+// one by one (streamedEvents.js).
+//
+// Streaming a tool call's arguments needs partialArgs, and
+// toolConfig.functionCallingConfig.streamFunctionCallArguments is Vertex-only:
+// this API's v1beta discovery doc (revision 20260918) gives FunctionCallingConfig
+// only `mode` and `allowedFunctionNames`. Sending it buys a 400 and costs the
+// player a request, so it is not sent.
+//
+// The alternative, JSON mode, does stream but Gemini refuses it alongside tools
+// ("Function calling with a response mime type: 'application/json' is
+// unsupported"), so a skip would lose its lookup functions. Declined: the
+// simulator keeps the ability to ask the engine questions.
+//
+// streamAssembly.js still assembles partialArgs if they ever arrive, so the day
+// the field reaches this API, asking for it is the only change.
+
 // AI calls go straight from the browser to the provider so the player's API key
 // only ever reaches the provider — never a server or a community node. Direct is
 // always tried first. Only when the page is served from a machine the player
@@ -312,19 +391,21 @@ function noteStructuredModeLanding(key, startedAt, landedAt, configured) {
     if (structuredModeObserver.shouldSuggest(key, configured)) {
         try {
             window.dispatchEvent(new CustomEvent("ai:structured-mode-suggestion", {
-                detail: { key, mode: landedAt, provider: key.split("|")[0] },
+                detail: { key, mode: landedAt },
             }));
         } catch { /* no window (tests, workers) — the observation still stands */ }
     }
 }
 
 // Asked by the UI when it wants to know whether there is anything to offer.
+// The evidence is kept per Fallback entry — the id is the observer's key — so
+// the first entry with something to offer is the one asked about.
 export const getStructuredModeSuggestion = () => {
-    const provider = getStoredProvider();
-    const settings = getProviderSettings(provider);
-    const key = `${provider}|${settings.model || ""}`;
-    const mode = structuredModeObserver.shouldSuggest(key, settings.structuredMode);
-    return mode ? { key, mode, provider } : null;
+    for (const entry of getResolvedFallbackList()) {
+        const mode = structuredModeObserver.shouldSuggest(entry.id, entry.structuredMode);
+        if (mode) return { key: entry.id, mode, label: entry.label };
+    }
+    return null;
 };
 
 // "No thanks" — remembered for the session so it does not ask again every turn.
@@ -332,12 +413,13 @@ export const declineStructuredModeSuggestion = (key, mode) => {
     structuredModeObserver.decline(key, mode);
 };
 
-// "Yes" — write the setting, then forget the evidence so a later change in the
-// endpoint's behaviour is learned fresh rather than judged against stale data.
-export const acceptStructuredModeSuggestion = (key, mode, provider) => {
-    setProviderField(provider || getStoredProvider(), "structuredMode", mode);
+// "Yes" — write the setting on that entry, then forget the evidence so a later
+// change in the endpoint's behaviour is learned fresh rather than judged
+// against stale data.
+export const acceptStructuredModeSuggestion = (key, mode) => {
+    updateEntry(key, { structuredMode: mode });
     structuredModeObserver.clear(key);
-    logDebugEvent("ai", `Structured output set to ${mode} for ${provider}.`, { key });
+    logDebugEvent("ai", `Structured output set to ${mode} for a Fallback entry.`, { key });
 };
 
 const PAGE_IS_LOCAL = isLocallyServed();
@@ -481,7 +563,7 @@ function emptyReplyMessage(providerLabel) {
 function streamFailureError(providerLabel, streamResult, { retried = false, fallbackMessage } = {}) {
     const detail = errorPayloadText(streamResult.streamError);
     const busy = isBusyErrorPayload(streamResult.streamError);
-    return aiFailureError(
+    const error = aiFailureError(
         streamResult.streamError
             ? (busy ? busyProviderMessage(providerLabel, detail, retried) : providerErrorReplyMessage(providerLabel, detail))
             : fallbackMessage,
@@ -494,6 +576,10 @@ function streamFailureError(providerLabel, streamResult, { retried = false, fall
             sampleFrames: streamResult.sample,
         },
     );
+    // The provider's own refusal says whether another Fallback entry is worth
+    // asking; a stream that simply came back empty does not.
+    if (streamResult.streamError) error.providerFailure = classifyProviderFailure({ payload: streamResult.streamError });
+    return error;
 }
 
 // One retry, five seconds later. Long enough for a load spike to pass, short
@@ -508,7 +594,32 @@ const OVERLOADED_RETRY_DELAY = 5000;
 // inside a stream — this just makes the HTTP status agree with the stream frame.
 // Without it a 502 threw immediately while an identical 502 delivered as a frame
 // got three attempts, and a single gateway hiccup cost a chat reply or a turn.
-const RETRYABLE_HTTP_STATUSES = new Set([429, 502, 503, 504]);
+// 529 is Anthropic's own status for overloaded_error, the same thing again.
+const RETRYABLE_HTTP_STATUSES = new Set([429, 502, 503, 504, 529]);
+
+// One of the statuses above: wait and go round again, or throw an error that
+// says why, for the Fallback list. A spent quota never retries — every
+// provider but Gemini used to retry it three times, OpenAI's insufficient_quota
+// included — and how often busy and Rate limited retry is the list's rule
+// (shouldRetryProviderFailure), so every provider path agrees. Gemini has its
+// own (callGemini), because its messages name its quotas.
+async function retryOrFailByStatus(response, { attempt, retries, retryDelay, deadline, signal, canFallBack, rateLimitPolicy, providerLabel }) {
+    const payload = await readErrorPayload(response);
+    const failure = classifyProviderFailure({ status: response.status, payload });
+    const details = extractErrorMessage(payload, "");
+    if (failure.kind === "spent") {
+        throw providerFailureError(`${providerLabel} says the quota or balance on this key is used up. ${details}`.trim(), failure);
+    }
+    const wait = failure.kind === "rateLimited" ? (failure.waitMs ?? retryDelay) : retryDelay;
+    if (!shouldRetryProviderFailure({ failure, attempt, retries, canFallBack, rateLimitPolicy }) || !canRetryBeforeDeadline(deadline, wait)) {
+        const message = failure.kind === "rateLimited"
+            ? `${providerLabel} is rate limiting this key after ${attempt} attempt${attempt === 1 ? "" : "s"}. ${details}`.trim()
+            : extractErrorMessage(payload, `${providerLabel} is busy right now. Try again in a moment.`);
+        throw providerFailureError(message, failure);
+    }
+    console.warn(`${providerLabel} ${failure.kind === "rateLimited" ? "is rate limiting" : "is busy"}. Retrying in ${wait / 1000}s... (attempt ${attempt}/${retries})`);
+    await sleep(wait, signal);
+}
 
 async function streamTextSSE(response, extractDelta, onChunk) {
     const reader = response.body.getReader();
@@ -601,31 +712,51 @@ const anthropicStreamDelta = (json) => {
     return "";
 };
 
+// The conversation is kept in Gemini's shape ({ role, parts }) and rendered per
+// provider here. Text turns render as they always did; a lookup round (a model
+// turn of functionCall parts answered by a user turn of functionResponse
+// parts, toolTurns.js) renders as that provider's tool-call exchange.
 function toOpenAIMessages(systemPrompt, history) {
-    const messages = [{ role: "system", content: systemPrompt }];
-
-    for (const entry of history) {
-        messages.push({
-            role: entry.role === "model" ? "assistant" : "user",
-            content: entry.parts?.[0]?.text ?? "",
-        });
-    }
-
-    return messages;
+    return openAiMessagesFromHistory(systemPrompt, history);
 }
 
 function toAnthropicMessages(history) {
-    return history.map((entry) => ({
-        role: entry.role === "model" ? "assistant" : "user",
-        content: [{
-            type: "text",
-            text: entry.parts?.[0]?.text ?? "",
-        }],
-    }));
+    return anthropicMessagesFromHistory(history);
 }
 
-// The model one call runs with: the task's own override when the player set one
-// in Settings → Per-task models, else the provider default (typed, or discovered
+// An error that says how the call failed, for the Fallback list
+// (fallbackRunner.js): Spent, Unusable, Rate limited, busy or other. Only the
+// first four move a call to the next entry.
+function providerFailureError(message, failure, extra = {}) {
+    const error = Object.assign(new Error(message), extra);
+    error.providerFailure = failure;
+    return error;
+}
+
+// The same, for a response the provider refused outright: a request too big
+// for the model's window gets the message that says so and names the fix
+// (contextWindowMessage), whatever words the provider used.
+const refusedRequestError = (providerLabel, message, failure, requestChars = 0) => providerFailureError(
+    failure?.kind === "tooBig" ? contextWindowMessage(providerLabel, message, requestChars) : message,
+    failure,
+);
+
+// Spent and Unusable: no retry, and none of a provider's own concessions
+// (streaming off, a lower structured-output rung) can fix them either.
+const waitingCannotFix = (failure) => failure.kind === "unusable" || failure.kind === "spent";
+
+// A server the browser could not reach at all (a local model that is not
+// running, the network down) is busy for the Fallback list: worth skipping for a
+// minute, and worth trying again after. Matched on the browsers' own wording, so
+// a TypeError from a bug in this file is never mistaken for one.
+const UNREACHABLE_TEXT = /failed to fetch|fetch failed|networkerror|load failed|network request failed/i;
+const isUnreachableError = (error) => error instanceof TypeError && UNREACHABLE_TEXT.test(String(error.message));
+
+// An entry that is missing what its provider needs cannot answer until the
+// player edits it — the same as a rejected key.
+const missingSetupError = (message, reason) => providerFailureError(message, { kind: "unusable", reason });
+
+// The model one call runs with: the Fallback entry's own (typed, or discovered
 // below). Recorded afterwards so the model fields can suggest what was used.
 async function resolveModel(provider, options = {}) {
     const model = await resolveConfiguredModel(provider, options);
@@ -633,11 +764,17 @@ async function resolveModel(provider, options = {}) {
     return model;
 }
 
-async function resolveConfiguredModel(provider, { endpoint = "", headers = {}, fallbackModel = "", providerLabel, signal, taskKey } = {}) {
-    const configuredModel = getModelForTask(provider, taskKey).trim();
+// A model discovered from a server's /models list, per entry, for the session.
+// Never written into the entry: a blank model means "whatever the server
+// serves", and should keep meaning that when the server's list changes.
+const discoveredModels = new Map(); // entry id -> model id
+
+async function resolveConfiguredModel(provider, { entrySettings, endpoint = "", headers = {}, fallbackModel = "", providerLabel, signal } = {}) {
+    const configuredModel = String(entrySettings?.model ?? "").trim();
 
     if (configuredModel) {
-        return provider === "gemini" ? normalizeGeminiModel(configuredModel) : configuredModel;
+        if (provider === "gemini") return normalizeGeminiModel(configuredModel);
+        return matchServedModel(provider, configuredModel, { endpoint, headers, providerLabel, signal });
     }
 
     if (fallbackModel) {
@@ -645,14 +782,17 @@ async function resolveConfiguredModel(provider, { endpoint = "", headers = {}, f
     }
 
     if (!providerSupportsModelDiscovery(provider)) {
-        throw new Error(`Go to **settings** and enter a model for ${providerLabel}.`);
+        throw missingSetupError(`Go to **settings** and enter a model for ${providerLabel}.`, "no model set");
     }
 
     const normalizedEndpoint = normalizeEndpoint(endpoint);
 
     if (!normalizedEndpoint) {
-        throw new Error(`Go to **settings** and enter an endpoint for ${providerLabel}.`);
+        throw missingSetupError(`Go to **settings** and enter an endpoint for ${providerLabel}.`, "no endpoint set");
     }
+
+    const cached = entrySettings?.id ? discoveredModels.get(entrySettings.id) : "";
+    if (cached) return cached;
 
     try {
         const response = await providerFetch(`${normalizedEndpoint}/models`, { method: "GET", headers, signal });
@@ -670,44 +810,147 @@ async function resolveConfiguredModel(provider, { endpoint = "", headers = {}, f
         }
 
         console.log(`Auto-detected ${providerLabel} model:`, discoveredModel);
-        setProviderField(provider, "model", discoveredModel);
+        if (entrySettings?.id) discoveredModels.set(entrySettings.id, discoveredModel);
         return discoveredModel;
     } catch (error) {
         if (signal?.aborted) throw signal.reason ?? error;
         console.warn(`Could not auto-detect model for ${providerLabel}:`, error);
-        throw new Error(`Could not auto-detect a model for ${providerLabel}. Enter a model manually in **settings**.`);
+        // A server that cannot be reached may come back; one that answers
+        // with no models needs the player.
+        throw providerFailureError(
+            `Could not auto-detect a model for ${providerLabel}. Enter a model manually in **settings**.`,
+            isUnreachableError(error) ? { kind: "busy", reason: "could not be reached" } : { kind: "unusable", reason: "no model found on the server" },
+        );
     }
 }
 
+// Issue #721. A configured id that names a model FILE (see modelIds.js) is
+// checked against the server's own /models list before it is sent: classic
+// llama-server reports its -m path as the model id, the game remembers and
+// suggests that id, and the same server in router mode only answers to the
+// model's NAME. Exact matches win, so servers whose ids really are paths are
+// untouched; with no list, or no match, the configured id goes out unchanged —
+// exactly what happened before this existed. Every other id skips all of it.
+//
+// Cached per endpoint for a minute: one lookup covers a whole turn's worth of
+// task calls rather than one per call, and a model the player loads into the
+// router mid-session is picked up within the minute.
+const SERVED_MODELS_TTL_MS = 60 * 1000;
+const servedModelsCache = new Map(); // endpoint -> { at, ids }
+// A turn makes many task calls; say it once per model, not on every one of them.
+const warnedServedModels = new Set();
+const warnServedModelOnce = (key, message) => {
+    if (warnedServedModels.has(key)) return;
+    warnedServedModels.add(key);
+    console.warn(message);
+};
+
+async function listServedModelIds(endpoint, headers, signal) {
+    const cached = servedModelsCache.get(endpoint);
+    if (cached && Date.now() - cached.at < SERVED_MODELS_TTL_MS) return cached.ids;
+    const response = await providerFetch(`${endpoint}/models`, { method: "GET", headers, signal });
+    if (!response.ok) return null;
+    const data = await response.json();
+    const ids = (data?.data ?? [])
+        .map((entry) => entry?.id)
+        .filter((id) => typeof id === "string" && id.trim());
+    servedModelsCache.set(endpoint, { at: Date.now(), ids });
+    return ids;
+}
+
+async function matchServedModel(provider, configuredModel, { endpoint = "", headers = {}, providerLabel = provider, signal } = {}) {
+    if (!providerSupportsModelDiscovery(provider) || !looksLikeModelFilePath(configuredModel)) return configuredModel;
+    const normalizedEndpoint = normalizeEndpoint(endpoint);
+    if (!normalizedEndpoint) return configuredModel;
+
+    let served;
+    try {
+        served = await listServedModelIds(normalizedEndpoint, headers, signal);
+    } catch (error) {
+        if (signal?.aborted) throw signal.reason ?? error;
+        return configuredModel; // no list, no guess
+    }
+
+    const match = resolveServedModelId(configuredModel, served);
+    if (match && match !== configuredModel) {
+        warnServedModelOnce(`${normalizedEndpoint}|${configuredModel}|${match}`, `[ai] ${providerLabel} does not serve "${configuredModel}"; using "${match}", the same model by name.`);
+        return match;
+    }
+    if (!match && served?.length) {
+        warnServedModelOnce(`${normalizedEndpoint}|${configuredModel}|`, `[ai] ${providerLabel} does not serve "${configuredModel}". It offers: ${served.join(", ")}.`);
+    }
+    return configuredModel;
+}
+
 async function callGemini(systemPrompt, history, {
+    canFallBack = false,
     deadline,
+    entrySettings,
     maxTokens = 8192,
     onActivity,
     onChunk,
+    onRequest,
+    onToolStream,
     onUsage,
+    rateLimitPolicy = "wait",
     retries = 3,
     retryDelay = 15000,
     onModel,
     signal,
-    taskKey,
     tool,
+    lookupTools,
+    requireOutputTool = false,
 } = {}) {
-    const settings = getProviderSettings("gemini");
+    const settings = entrySettings;
+    // Lookup functions (lookupTools.js) declared beside the output function.
+    // They stay declared for the whole conversation (the history carries calls
+    // to them); which ones the model may CALL this round is allowedFunctionNames.
+    const lookupDeclarations = tool && Array.isArray(lookupTools) ? lookupTools : [];
     const apiKey = settings.apiKey.trim();
 
     if (!apiKey) {
-        throw new Error("Go to **settings** and paste your Gemini API key - you can get it at https://aistudio.google.com/app/apikey");
+        throw missingSetupError("Go to **settings** and paste your Gemini API key - you can get it at https://aistudio.google.com/app/apikey", "no API key");
     }
 
     const model = await resolveModel("gemini", {
+        entrySettings,
         fallbackModel: GEMINI_DEFAULT_MODEL,
         providerLabel: "Gemini",
         signal,
-        taskKey,
     });
     onModel?.(model);
 
     const customParams = parseCustomParams(settings.customParams, "Gemini");
+
+    // Sorted once for every retryable status either path below can see, so the
+    // Fallback list and the retry count agree (shouldRetryProviderFailure).
+    // Chat waits less for a busy model than a turn does: a player is watching.
+    const retryOrFail = async (response, attempt, busyDelay = retryDelay) => {
+        const payload = await readErrorPayload(response);
+        const failure = classifyProviderFailure({ status: response.status, payload });
+        const details = extractErrorMessage(payload, `Gemini returned ${response.status}.`);
+        if (failure.kind === "spent") {
+            throw providerFailureError(`Gemini returned 429: the allowance or balance on this key is used up. ${details}`.trim(), failure);
+        }
+        // Honour the provider's own RetryInfo when it sent one; it knows the
+        // window better than a fixed guess does.
+        const wait = failure.kind === "rateLimited" ? (failure.waitMs ?? retryDelay) : busyDelay;
+        if (!shouldRetryProviderFailure({ failure, attempt, retries, canFallBack, rateLimitPolicy }) || !canRetryBeforeDeadline(deadline, wait)) {
+            if (failure.kind === "rateLimited") {
+                throw providerFailureError(
+                    `Gemini is rate limiting this key after ${attempt} attempt${attempt === 1 ? "" : "s"}. ${details} `
+                    + "Wait a minute and try again, or lower the request rate in Settings.".trim(),
+                    failure,
+                );
+            }
+            if (failure.kind === "busy") {
+                throw providerFailureError(`Gemini is temporarily unavailable after ${attempt} attempt${attempt === 1 ? "" : "s"}. Try again in a minute.`, failure);
+            }
+            throw refusedRequestError("Gemini", extractErrorMessage(payload, `Gemini API request failed (${response.status})`), failure);
+        }
+        console.warn(`[ai] Gemini ${failure.kind === "rateLimited" ? "rate limited" : "is busy"}. Retrying in ${wait / 1000}s... (attempt ${attempt}/${retries})`);
+        await sleep(wait, signal);
+    };
 
     // Advisor/chat streaming: with an onChunk callback (and no tool), use the
     // streaming endpoint so the reply appears token-by-token. maxOutputTokens
@@ -715,16 +958,18 @@ async function callGemini(systemPrompt, history, {
     // deliberately sends NO cap so long simulations are never truncated.
     if (onChunk && !tool) {
         const streamUrl = getGeminiStreamUrl(model, apiKey);
-        // Two passes at most: the second only ever happens when the first came
-        // back with an overloaded/unavailable error INSIDE the stream, which
-        // arrives as an HTTP 200 and so never reaches the status-code retry.
+        // A busy or Rate limited status is retried as the Fallback list's rule
+        // says (one retry when there is somewhere to fall back to). An
+        // overloaded error INSIDE the stream arrives as an HTTP 200, never
+        // reaches that check, and gets its own single retry.
+        let retriedInStream = false;
         for (let pass = 1; ; pass += 1) {
             const response = await fetch(streamUrl, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
                     system_instruction: { parts: [{ text: systemPrompt }] },
-                    contents: history,
+                    contents: geminiContentsFromHistory(history),
                     generationConfig: {
                         maxOutputTokens: Math.max(1, Number(maxTokens) || 8192),
                         ...(getReasoningEnabled() ? { thinkingConfig: { thinkingBudget: 8192 } } : {}),
@@ -733,19 +978,28 @@ async function callGemini(systemPrompt, history, {
                 }),
                 signal,
             });
+            onRequest?.(response.status);
+            if (RETRYABLE_HTTP_STATUSES.has(response.status)) {
+                await retryOrFail(response, pass, OVERLOADED_RETRY_DELAY);
+                continue;
+            }
             if (!response.ok) {
                 const payload = await readErrorPayload(response);
-                throw new Error(extractErrorMessage(payload, `Gemini API request failed (${response.status})`));
+                throw refusedRequestError("Gemini",
+                    extractErrorMessage(payload, `Gemini API request failed (${response.status})`),
+                    classifyProviderFailure({ status: response.status, payload }),
+                );
             }
             const streamResult = await streamTextSSE(response, geminiStreamDelta, onChunk);
             if (streamResult.text) return streamResult.text;
-            if (pass === 1 && isBusyErrorPayload(streamResult.streamError) && canRetryBeforeDeadline(deadline, OVERLOADED_RETRY_DELAY)) {
+            if (!retriedInStream && isBusyErrorPayload(streamResult.streamError) && canRetryBeforeDeadline(deadline, OVERLOADED_RETRY_DELAY)) {
+                retriedInStream = true;
                 console.warn(`[ai] Gemini reported "${errorPayloadText(streamResult.streamError)}" mid-stream; retrying once in ${OVERLOADED_RETRY_DELAY / 1000}s`);
                 await sleep(OVERLOADED_RETRY_DELAY, signal);
                 continue;
             }
             throw streamFailureError("Gemini", streamResult, {
-                retried: pass > 1,
+                retried: retriedInStream,
                 fallbackMessage: "Gemini response did not contain text.",
             });
         }
@@ -770,81 +1024,72 @@ async function callGemini(systemPrompt, history, {
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
                 system_instruction: { parts: [{ text: systemPrompt }] },
-                contents: history,
+                contents: geminiContentsFromHistory(history),
                 // Reasoning toggle (settings): let thinking-capable Gemini models think.
                 ...(getReasoningEnabled()
                      ? { generationConfig: { thinkingConfig: { thinkingBudget: 8192 } } }
                      : {}),
                 ...customParams,
                 ...(tool ? {
-                    tools: [{ functionDeclarations: [{
-                        name: tool.name,
-                        description: tool.description,
-                        parameters: toGeminiSchema(tool.schema),
-                    }] }],
+                    tools: [{ functionDeclarations: [
+                        {
+                            name: tool.name,
+                            description: tool.description,
+                            parameters: toGeminiSchema(tool.schema),
+                        },
+                        ...lookupDeclarations.map((entry) => ({
+                            name: entry.name,
+                            description: entry.description,
+                            parameters: toGeminiSchema(entry.schema),
+                        })),
+                    ] }],
                     toolConfig: { functionCallingConfig: {
                         mode: "ANY",
-                        allowedFunctionNames: [tool.name],
+                        // The final round of a lookup conversation may only answer.
+                        allowedFunctionNames: [tool.name, ...(requireOutputTool ? [] : lookupDeclarations.map((entry) => entry.name))],
                     } },
                 } : {}),
             }),
             signal,
         });
+        // Every response is one request against the player's allowance, whatever
+        // became of it (requestBudget.js): a lookup round, a retry, a refusal.
+        onRequest?.(response.status);
 
         // A 429 used to be fatal here while every other provider retried it, so
         // one per-minute trip on a free-tier key destroyed the turn and dropped
         // the player to canned events. Only a SPENT quota (daily allowance, or
-        // billing) is worth failing over; a rate limit is what waiting is for.
-        if (response.status === 429) {
-            const payload = await readErrorPayload(response);
-            const details = extractErrorMessage(payload, "Gemini returned 429.");
-
-            if (isQuotaExhaustedPayload(payload)) {
-                throw new Error(`Gemini returned 429. Your balance or quota appears to be exhausted. ${details}`.trim());
-            }
-
-            // Honour the provider's own RetryInfo when it sent one; it knows the
-            // window better than a fixed guess does.
-            const wait = retryDelayMsFromPayload(payload) ?? retryDelay;
-            if (attempt === retries || !canRetryBeforeDeadline(deadline, wait)) {
-                throw new Error(
-                    `Gemini is rate limiting this key after ${retries} attempts. ${details} `
-                    + "Wait a minute and try again, or lower the request rate in Settings.".trim(),
-                );
-            }
-
-            console.warn(`[ai] Gemini rate limited. Retrying in ${wait / 1000}s... (attempt ${attempt}/${retries})`);
-            await sleep(wait, signal);
-            continue;
-        }
-
-        // 429 is handled above (a rate limit and a spent quota need different
-        // answers). This is every other transient gateway failure.
+        // billing) is worth failing over; a rate limit is what waiting is for —
+        // unless the player chose to move straight to the next Fallback entry.
         if (RETRYABLE_HTTP_STATUSES.has(response.status)) {
-            if (attempt === retries || !canRetryBeforeDeadline(deadline, retryDelay)) {
-                throw new Error(`Gemini is temporarily unavailable after ${retries} attempts. Try again in a minute.`);
-            }
-
-            console.warn(`Gemini is busy. Retrying in ${retryDelay / 1000}s... (attempt ${attempt}/${retries})`);
-            await sleep(retryDelay, signal);
+            await retryOrFail(response, attempt);
             continue;
         }
 
         if (!response.ok) {
             const payload = await readErrorPayload(response);
-            throw new Error(extractErrorMessage(payload, `Gemini API request failed (${response.status})`));
+            throw refusedRequestError("Gemini",
+                extractErrorMessage(payload, `Gemini API request failed (${response.status})`),
+                classifyProviderFailure({ status: response.status, payload }),
+            );
         }
 
         // Branch on what actually came back, not on what was asked for: an edge
         // or proxy that ignored alt=sse still answers plain JSON, and that must
         // keep working exactly as it did.
         const data = String(response.headers.get("content-type") || "").includes("text/event-stream")
-            ? await readGeminiStreamedResponse(response, onActivity)
-            : await response.json();
+            ? await readGeminiStreamedResponse(response, onActivity, onToolStream)
+            : await readJsonAnswer(response, "Gemini");
         onUsage?.(data);
         if (tool) {
             const toolInput = extractGeminiToolInput(data, tool);
             if (toolInput) return { rawText: joinGeminiParts(data?.candidates?.[0]?.content?.parts), toolInput };
+            // Not the answer but a question: the model called lookup functions.
+            // Handed back to callAI, which answers them and asks again.
+            if (lookupDeclarations.length) {
+                const lookupCalls = lookupCallsFromGemini(data, tool.name);
+                if (lookupCalls.length) return { rawText: joinGeminiParts(data?.candidates?.[0]?.content?.parts), toolInput: null, lookupCalls };
+            }
 
             // Now that tool calls stream, an overloaded model can refuse INSIDE
             // the stream — HTTP 200, an error frame, no function call — where the
@@ -861,6 +1106,16 @@ async function callGemini(systemPrompt, history, {
                 await sleep(OVERLOADED_RETRY_DELAY, signal);
                 continue;
             }
+            // Fragments that stopped partway assemble into a valid object missing
+            // half the turn, so streamAssembly.js drops the call and leaves this
+            // for the log alone.
+            if (data?.partialToolJson) {
+                logDebugEvent("warn", `[ai] Gemini tool call was cut off mid-argument.`, {
+                    partialChars: data.partialToolJson.length,
+                }, { verbose: true });
+            }
+            // Still refusing: say so, rather than hand back an empty "answer".
+            if (!streamedText && streamedError) throw toolStreamRefusalError("Gemini", streamedError, retriedAfterOverload);
 
             return { rawText: streamedText, toolInput: null };
         }
@@ -891,11 +1146,15 @@ async function callOpenAIStyleChatCompletions({
     toolStrict = false,
     retries = 3,
     retryDelay = 15000,
+    canFallBack = false,
+    rateLimitPolicy = "wait",
     deadline,
     signal,
     tool,
     onActivity,
     onChunk,
+    onRequest,
+    onToolStream,
     onUsage,
     allowJsonSchemaFallback = false,
     configuredStructuredMode = "auto",
@@ -903,13 +1162,27 @@ async function callOpenAIStyleChatCompletions({
     maxTokens,
     tokenLimitField = "max_tokens",
     fetchRequest = providerFetch,
+    lookupTools,
+    requireOutputTool = false,
 }) {
+    // Lookup functions (lookupTools.js) beside the output function. On the
+    // round that must end in an answer they are left out altogether: with one
+    // tool declared, tool_choice "required" IS the forcing, on every gateway
+    // that honours it at all. (The history still carries the earlier calls;
+    // the chat-completions API does not require those tools to be declared.)
+    const lookupDeclarations = tool && Array.isArray(lookupTools) && !requireOutputTool ? lookupTools : [];
     // Where to BEGIN on the ladder. "auto" (the default) starts at the strongest
     // method; a configured mode starts lower, skipping rungs this endpoint has
     // already been shown not to honour. Either way the ladder can still walk
     // down from here — a setting is a starting point, never a lock.
     const startedStructuredMode = startingStructuredMode(configuredStructuredMode);
     let structuredMode = tool ? startedStructuredMode : "text";
+    // How much this request carries, for the context-window message below:
+    // the number the player needs to compare against the model's limit.
+    const requestChars = String(systemPrompt ?? "").length + (Array.isArray(history) ? history : []).reduce((total, message) => {
+        const parts = Array.isArray(message?.parts) ? message.parts : [];
+        return total + (parts.length ? parts.reduce((sum, part) => sum + String(part?.text ?? "").length, 0) : String(message?.content ?? "").length);
+    }, 0);
     let disableToolReasoning = false;
     // Set once the model has proved it needs more room than the caller asked for
     // (see the all-reasoning retry below). Lifting the cap entirely hands the
@@ -1011,7 +1284,10 @@ async function callOpenAIStyleChatCompletions({
                     // the schema as-is and constrain generation with it, which is
                     // what stops a model emitting an unbalanced or mistyped argument.
                     ...(toolStrict ? { strict: true } : {}),
-                    } }],
+                    } }, ...lookupDeclarations.map((entry) => ({
+                        type: "function",
+                        function: { name: entry.name, description: entry.description, parameters: entry.schema },
+                    }))],
                     // The string form, NOT OpenAI's {type:"function",function:{name}}
                     // object: llama.cpp-based servers (LM Studio, Jan, local Qwen et
                     // al.) only parse a string here — the object form logged
@@ -1032,6 +1308,7 @@ async function callOpenAIStyleChatCompletions({
                 } : {}),
             },
         });
+        onRequest?.(response.status);
 
         // One read of the body serves every concession below — a Response can only
         // be read once, and the streaming retry has to look at the message before
@@ -1039,6 +1316,13 @@ async function callOpenAIStyleChatCompletions({
         if ([400, 422].includes(response.status)) {
             const payload = await readErrorPayload(response);
             const errorMessage = extractErrorMessage(payload, `${providerLabel} request failed (${response.status})`);
+            // A bad key, a missing model or a spent balance can arrive as a 400
+            // too; none of the concessions below would fix those.
+            const failure = classifyProviderFailure({ status: response.status, payload });
+            if (waitingCannotFix(failure)) throw providerFailureError(errorMessage, failure);
+            // Too big for the window: no concession below shrinks the request, and
+            // walking the ladder would spend a request per rung finding that out.
+            if (failure.kind === "tooBig") throw providerFailureError(contextWindowMessage(providerLabel, errorMessage, requestChars), failure);
 
             // Cheapest concession first. A gateway that refuses stream+tools still
             // does tools, it just stops keeping the connection warm — whereas
@@ -1063,7 +1347,7 @@ async function callOpenAIStyleChatCompletions({
                     continue;
                 }
 
-                throw new Error(errorMessage);
+                throw providerFailureError(errorMessage, failure);
             }
 
             if (structuredMode === "json_schema" && allowJsonSchemaFallback) {
@@ -1079,24 +1363,28 @@ async function callOpenAIStyleChatCompletions({
             // Nothing left to concede. Throw the message we already read rather
             // than falling through to the generic handler below, which would try
             // to read this same body a second time and get nothing.
-            throw new Error(errorMessage);
+            throw providerFailureError(errorMessage, failure);
         }
 
         if (RETRYABLE_HTTP_STATUSES.has(response.status)) {
-            if (attempt === retries || !canRetryBeforeDeadline(deadline, retryDelay)) {
-                const payload = await readErrorPayload(response);
-                throw new Error(extractErrorMessage(payload, `${providerLabel} is busy right now. Try again in a moment.`));
-            }
-
-            console.warn(`${providerLabel} is busy. Retrying in ${retryDelay / 1000}s... (attempt ${attempt}/${retries})`);
-            await sleep(retryDelay, signal);
+            await retryOrFailByStatus(response, {
+                attempt, retries, retryDelay, deadline, signal, canFallBack, rateLimitPolicy, providerLabel,
+            });
             attempt += 1;
             continue;
         }
 
         if (!response.ok) {
             const payload = await readErrorPayload(response);
-            throw new Error(extractErrorMessage(payload, `${providerLabel} request failed (${response.status})`));
+            const detail = extractErrorMessage(payload, `${providerLabel} request failed (${response.status})`);
+            // Too big for the model: say so, with the size, and do not let it be
+            // mistaken for a busy provider or a broken answer. "tooBig" lets the
+            // Fallback list try an entry with a larger window, and remembers
+            // this one's (contextWindow.js).
+            if (isContextWindowErrorPayload(payload?.error ?? payload)) {
+                throw providerFailureError(contextWindowMessage(providerLabel, detail, requestChars), { kind: "tooBig", reason: detail });
+            }
+            throw providerFailureError(detail, classifyProviderFailure({ status: response.status, payload }));
         }
 
         // Advisor/chat streaming: forward tokens to the UI as they arrive. Guard
@@ -1152,14 +1440,28 @@ async function callOpenAIStyleChatCompletions({
         // stream is safe: a gateway that quietly ignores it still lands here.
         const responseType = String(response.headers.get("content-type") || "");
         const data = responseType.includes("text/event-stream")
-            ? await readOpenAIStreamedResponse(response, onActivity)
-            : await response.json();
+            ? await readOpenAIStreamedResponse(response, onActivity, onToolStream)
+            : await readJsonAnswer(response, providerLabel);
         onUsage?.(data);
         const text = extractOpenAIMessageText(data);
+
+        // Some gateways put "the request does not fit the context window" in a
+        // 200 body as if it were the answer. It is not one, and no retry can help
+        // (the retry carries the failed answer too), so say what happened rather
+        // than letting it fail downstream as "did not contain parseable JSON".
+        if (isContextWindowErrorText(text) || isContextWindowErrorPayload(data?.error)) {
+            const detail = text || errorPayloadText(data?.error);
+            throw providerFailureError(contextWindowMessage(providerLabel, detail, requestChars), { kind: "tooBig", reason: detail });
+        }
 
         if (tool) {
             const toolInput = structuredMode === "tool" ? extractOpenAIToolInput(data, tool) : null;
             if (toolInput) return { rawText: text, toolInput };
+            // Not the answer but a question: the model called lookup functions.
+            if (structuredMode === "tool" && lookupDeclarations.length) {
+                const lookupCalls = lookupCallsFromOpenAI(data, tool.name);
+                if (lookupCalls.length) return { rawText: text, toolInput: null, lookupCalls };
+            }
 
             // Now that tool calls stream, an overloaded provider can refuse INSIDE
             // the stream — HTTP 200, an error frame, no tool call — where the same
@@ -1174,6 +1476,12 @@ async function callOpenAIStyleChatCompletions({
                 console.warn(`[ai] ${providerLabel} reported "${errorPayloadText(streamedError)}" mid-stream; retrying once in ${OVERLOADED_RETRY_DELAY / 1000}s`);
                 await sleep(OVERLOADED_RETRY_DELAY, signal);
                 continue;
+            }
+            // Still refusing after that retry (or no time left for one): say so,
+            // rather than hand the task an empty "answer" to spend an attempt on.
+            // A partial tool call is left to the salvage pass, as before.
+            if (!text && streamedError && !extractOpenAIToolRaw(data, tool)) {
+                throw toolStreamRefusalError(providerLabel, streamedError, retriedAfterOverload);
             }
 
             // The model talked itself out of answering: no tool call, and the text
@@ -1265,11 +1573,12 @@ async function callOpenAIStyleChatCompletions({
 }
 
 async function callOpenAI(systemPrompt, history, opts = {}) {
-    const settings = getProviderSettings("openai");
+    const { entrySettings, ...rest } = opts;
+    const settings = entrySettings;
     const apiKey = settings.apiKey.trim();
 
     if (!apiKey) {
-        throw new Error("Go to **settings** and paste your OpenAI API key.");
+        throw missingSetupError("Go to **settings** and paste your OpenAI API key.", "no API key");
     }
 
     const headers = {
@@ -1278,11 +1587,11 @@ async function callOpenAI(systemPrompt, history, opts = {}) {
     };
 
     const model = await resolveModel("openai", {
+        entrySettings,
         endpoint: OPENAI_API_ENDPOINT,
         headers,
         providerLabel: "OpenAI",
         signal: opts.signal,
-        taskKey: opts.taskKey,
     });
     opts.onModel?.(model);
 
@@ -1296,9 +1605,9 @@ async function callOpenAI(systemPrompt, history, opts = {}) {
         customParams: parseCustomParams(settings.customParams, "OpenAI"),
         allowJsonSchemaFallback: false,
         configuredStructuredMode: settings.structuredMode,
-        observerKey: `${settings.provider}|${model}`,
+        observerKey: settings.id,
         tokenLimitField: "max_completion_tokens",
-        ...opts,
+        ...rest,
     });
 }
 
@@ -1308,7 +1617,10 @@ export async function discoverOpenCodeZenModels({ signal } = {}) {
     const response = await zenFetch(`${OPENCODE_ZEN_ENDPOINT}/models`, { method: "GET", signal });
     if (!response.ok) {
         const payload = await readErrorPayload(response);
-        throw new Error(extractErrorMessage(payload, "Could not load OpenCode Zen models. Try again later."));
+        throw providerFailureError(
+            extractErrorMessage(payload, "Could not load OpenCode Zen models. Try again later."),
+            classifyProviderFailure({ status: response.status, payload }),
+        );
     }
     return zenChatModels(await response.json());
 }
@@ -1318,7 +1630,7 @@ async function zenFetch(url, options) {
         return await providerFetch(url, options);
     } catch (error) {
         if (!PAGE_IS_LOCAL && !options?.signal?.aborted && error instanceof TypeError) {
-            throw new Error("OpenCode Zen could not be reached from this browser. Zen currently does not allow cross-origin browser requests (CORS). Use the Open Historia desktop app or your own local server; never paste your key into a public proxy.");
+            throw providerFailureError("OpenCode Zen could not be reached from this browser. Zen currently does not allow cross-origin browser requests (CORS). Use the Open Historia desktop app or your own local server; never paste your key into a public proxy.", { kind: "busy", reason: "could not be reached" });
         }
         throw error;
     }
@@ -1326,21 +1638,27 @@ async function zenFetch(url, options) {
 
 async function callOpenCodeZen(systemPrompt, history, opts = {}) {
     const provider = "opencode-zen";
-    const settings = getProviderSettings(provider);
+    const { entrySettings: settings, ...rest } = opts;
     const apiKey = settings.apiKey.trim();
-    if (!apiKey) throw new Error("Open AI settings, select OpenCode Zen, and follow the setup steps to create and paste your API key.");
+    if (!apiKey) throw missingSetupError("Open AI settings, select OpenCode Zen, and follow the setup steps to create and paste your API key.", "no API key");
 
     const customParams = parseCustomParams(settings.customParams, "OpenCode Zen");
     // Validate the EFFECTIVE model, including the escape hatch and task routing.
     // Otherwise custom JSON could bypass the paid-model opt-in, while telemetry
     // misleadingly named the free model in the ordinary settings field.
-    let model = customParams.model ?? getModelForTask(provider, opts.taskKey).trim();
+    let model = customParams.model ?? String(settings.model ?? "").trim();
     delete customParams.model;
     if (!model) {
         model = pickZenFreeModel(await discoverOpenCodeZenModels({ signal: opts.signal }));
-        if (!model) throw new Error("No supported free OpenCode Zen model is currently listed. Choose a model in AI settings; no paid model was selected automatically.");
+        if (!model) throw providerFailureError("No supported free OpenCode Zen model is currently listed. Choose a model in AI settings; no paid model was selected automatically.", { kind: "busy", reason: "no free Zen model is available" });
     }
-    model = validateZenModel(model, getProviderField(provider, "allowPaid") === "1");
+    try {
+        model = validateZenModel(model, settings.allowPaid === true);
+    } catch (error) {
+        // A disallowed or unsupported model cannot answer until its entry or
+        // connection is edited. Let the fallback list try the next entry.
+        throw missingSetupError(error.message, error.message);
+    }
     saveRecentModel(provider, model);
     opts.onModel?.(model);
 
@@ -1354,18 +1672,19 @@ async function callOpenCodeZen(systemPrompt, history, opts = {}) {
         customParams,
         allowJsonSchemaFallback: true,
         configuredStructuredMode: settings.structuredMode,
-        observerKey: `${provider}|${model}`,
-        ...opts,
+        observerKey: settings.id,
+        ...rest,
         fetchRequest: zenFetch,
     });
 }
 
 async function callOpenAICompatible(systemPrompt, history, opts = {}) {
-    const settings = getProviderSettings("openai-compatible");
+    const { entrySettings, ...rest } = opts;
+    const settings = entrySettings;
     const endpoint = normalizeEndpoint(settings.endpoint);
 
     if (!endpoint) {
-        throw new Error("Go to **settings**, select OpenAI Compatible, and enter your endpoint (for example http://localhost:11434/v1).");
+        throw missingSetupError("Go to **settings** and enter the OpenAI Compatible endpoint (for example http://localhost:11434/v1).", "no endpoint set");
     }
 
     const headers = {
@@ -1374,11 +1693,11 @@ async function callOpenAICompatible(systemPrompt, history, opts = {}) {
     };
 
     const model = await resolveModel("openai-compatible", {
+        entrySettings,
         endpoint,
         headers,
         providerLabel: "OpenAI Compatible",
         signal: opts.signal,
-        taskKey: opts.taskKey,
     });
     opts.onModel?.(model);
 
@@ -1393,9 +1712,9 @@ async function callOpenAICompatible(systemPrompt, history, opts = {}) {
         toolStrict: settings.toolStrict === true,
         allowJsonSchemaFallback: true,
         configuredStructuredMode: settings.structuredMode,
-        observerKey: `${settings.provider}|${model}`,
+        observerKey: settings.id,
         tokenLimitField: "max_tokens",
-        ...opts,
+        ...rest,
     });
 }
 
@@ -1424,35 +1743,43 @@ function buildAnthropicSystemContent(systemPrompt, staticPrefixEnd) {
 }
 
 async function callAnthropic(systemPrompt, history, {
+    canFallBack = false,
     deadline,
+    entrySettings,
     maxTokens,
     onActivity,
     onChunk,
+    onRequest,
+    onToolStream,
     onUsage,
+    rateLimitPolicy = "wait",
     retries = 3,
     retryDelay = 15000,
     onModel,
     signal,
     staticPrefixEnd,
-    taskKey,
     tool,
+    lookupTools,
+    requireOutputTool = false,
 } = {}) {
     let retriedAfterOverload = false;
+    // Lookup functions (lookupTools.js) declared beside the output function.
+    const lookupDeclarations = tool && Array.isArray(lookupTools) ? lookupTools : [];
     // Anthropic tool calls stream (see the request body below); this flips if the
     // endpoint refuses to, so the call retries buffered instead of failing.
     let streamingDisabled = false;
-    const settings = getProviderSettings("anthropic");
+    const settings = entrySettings;
     const apiKey = settings.apiKey.trim();
 
     if (!apiKey) {
-        throw new Error("Go to **settings** and paste your Anthropic API key.");
+        throw missingSetupError("Go to **settings** and paste your Anthropic API key.", "no API key");
     }
 
     const model = await resolveModel("anthropic", {
+        entrySettings,
         fallbackModel: ANTHROPIC_DEFAULT_MODEL,
         providerLabel: "Anthropic",
         signal,
-        taskKey,
     });
     onModel?.(model);
 
@@ -1502,8 +1829,13 @@ async function callAnthropic(systemPrompt, history, {
             messages: toAnthropicMessages(history),
             ...customParams,
             ...(tool ? {
-                tools: [{ name: tool.name, description: tool.description, input_schema: tool.schema }],
-                tool_choice: { type: "tool", name: tool.name },
+                tools: [
+                    { name: tool.name, description: tool.description, input_schema: tool.schema },
+                    ...lookupDeclarations.map((entry) => ({ name: entry.name, description: entry.description, input_schema: entry.schema })),
+                ],
+                // "any" while lookups are allowed (the model picks a lookup or
+                // the answer); the answer alone once the round budget is spent.
+                tool_choice: lookupDeclarations.length && !requireOutputTool ? { type: "any" } : { type: "tool", name: tool.name },
             } : {}),
         };
         const response = await fetch(`${ANTHROPIC_API_ENDPOINT}/messages`, {
@@ -1512,21 +1844,22 @@ async function callAnthropic(systemPrompt, history, {
             body: JSON.stringify(body),
             signal,
         });
+        onRequest?.(response.status);
 
         if (RETRYABLE_HTTP_STATUSES.has(response.status)) {
-            if (attempt === retries || !canRetryBeforeDeadline(deadline, retryDelay)) {
-                const payload = await readErrorPayload(response);
-                throw new Error(extractErrorMessage(payload, "Anthropic is busy right now. Try again in a moment."));
-            }
-
-            console.warn(`Anthropic is busy. Retrying in ${retryDelay / 1000}s... (attempt ${attempt}/${retries})`);
-            await sleep(retryDelay, signal);
+            await retryOrFailByStatus(response, {
+                attempt, retries, retryDelay, deadline, signal, canFallBack, rateLimitPolicy, providerLabel: "Anthropic",
+            });
             continue;
         }
 
         if (!response.ok) {
             const payload = await readErrorPayload(response);
             const message = extractErrorMessage(payload, `Anthropic request failed (${response.status})`);
+            // A spent balance ("credit balance is too low") and a bad key both
+            // arrive as errors none of the concessions below can fix.
+            const failure = classifyProviderFailure({ status: response.status, payload });
+            if (waitingCannotFix(failure)) throw providerFailureError(message, failure);
             // The cap was removed on purpose; honor the MODEL's own ceiling. Anthropic 400s
             // "max_tokens: <sent> > <max>, ..." — learn <max>, cache it, and retry at it.
             const capMatch = /max_tokens:\s*\d+\s*>\s*(\d+)/i.exec(message);
@@ -1553,7 +1886,7 @@ async function callAnthropic(systemPrompt, history, {
                 console.warn("[ai] Anthropic refused a streamed request; retrying buffered — long turns may time out.");
                 continue;
             }
-            throw new Error(message);
+            throw refusedRequestError("Anthropic", message, failure);
         }
 
         if (onChunk && !tool && String(response.headers.get("content-type") || "").includes("text/event-stream")) {
@@ -1579,12 +1912,17 @@ async function callAnthropic(systemPrompt, history, {
         // nothing downstream can tell the difference. Branch on what actually
         // arrived, so an endpoint that ignored stream:true still works.
         const data = String(response.headers.get("content-type") || "").includes("text/event-stream")
-            ? await readAnthropicStreamedResponse(response, onActivity)
-            : await response.json();
+            ? await readAnthropicStreamedResponse(response, onActivity, onToolStream)
+            : await readJsonAnswer(response, "Anthropic");
         onUsage?.(data);
         if (tool) {
             const toolInput = extractAnthropicToolInput(data, tool);
             if (toolInput) return { rawText: extractAnthropicText(data), toolInput };
+            // Not the answer but a question: the model called lookup functions.
+            if (lookupDeclarations.length) {
+                const lookupCalls = lookupCallsFromAnthropic(data, tool.name);
+                if (lookupCalls.length) return { rawText: extractAnthropicText(data), toolInput: null, lookupCalls };
+            }
 
             // Streaming moved the overload refusal from an HTTP status into an
             // error EVENT on a 200, which the status-code retry above cannot see.
@@ -1604,7 +1942,10 @@ async function callAnthropic(systemPrompt, history, {
                     partialChars: data.partialToolJson.length,
                 }, { verbose: true });
             }
-            return { rawText: extractAnthropicText(data), toolInput: null };
+            // Still refusing: say so, rather than hand back an empty "answer".
+            const anthropicToolText = extractAnthropicText(data);
+            if (!anthropicToolText && data?.error) throw toolStreamRefusalError("Anthropic", data.error, retriedAfterOverload);
+            return { rawText: anthropicToolText, toolInput: null };
         }
         const text = extractAnthropicText(data);
 
@@ -1617,36 +1958,44 @@ async function callAnthropic(systemPrompt, history, {
 }
 
 async function callAnthropicCompatible(systemPrompt, history, {
+    canFallBack = false,
     deadline,
+    entrySettings,
     maxTokens,
     onActivity,
     onChunk,
+    onRequest,
+    onToolStream,
     onUsage,
+    rateLimitPolicy = "wait",
     retries = 3,
     retryDelay = 15000,
     onModel,
     signal,
     staticPrefixEnd,
-    taskKey,
     tool,
+    lookupTools,
+    requireOutputTool = false,
 } = {}) {
     let retriedAfterOverload = false;
+    // Lookup functions (lookupTools.js) declared beside the output function.
+    const lookupDeclarations = tool && Array.isArray(lookupTools) ? lookupTools : [];
     // Same as the native path: tool calls stream, and this flips if the proxy
     // refuses to so the call retries buffered.
     let streamingDisabled = false;
-    const settings = getProviderSettings("anthropic-compatible");
+    const settings = entrySettings;
     const endpoint = normalizeEndpoint(settings.endpoint);
 
     if (!endpoint) {
-        throw new Error("Go to **settings**, select Anthropic Compatible, and enter your endpoint (a self-hosted Anthropic Messages API proxy).");
+        throw missingSetupError("Go to **settings** and enter the Anthropic Compatible endpoint (a self-hosted Anthropic Messages API proxy).", "no endpoint set");
     }
 
     const apiKey = settings.apiKey.trim();
     const model = await resolveModel("anthropic-compatible", {
+        entrySettings,
         fallbackModel: ANTHROPIC_DEFAULT_MODEL,
         providerLabel: "Anthropic Compatible",
         signal,
-        taskKey,
     });
     onModel?.(model);
 
@@ -1682,10 +2031,10 @@ async function callAnthropicCompatible(systemPrompt, history, {
     const anthropicStartMode = startingStructuredMode(settings.structuredMode) === "tool" ? "tool" : "text_json";
     let structuredMode = tool ? anthropicStartMode : "text";
     let insistedOnToolCall = false;
-    // Derived here rather than threaded in: this caller already knows both halves,
-    // and the observation is per provider AND model (the same proxy can front one
-    // model that honours tool calling and one that does not).
-    const observerKey = `anthropic-compatible|${model}`;
+    // Per Fallback entry: the observation is per provider AND model (the same
+    // proxy can front one model that honours tool calling and one that does not),
+    // and an entry is exactly that pair.
+    const observerKey = settings.id;
 
     for (let attempt = 1; attempt <= retries; attempt++) {
         const useToolChannel = Boolean(tool) && structuredMode === "tool";
@@ -1722,26 +2071,28 @@ async function callAnthropicCompatible(systemPrompt, history, {
             messages: toAnthropicMessages(history),
             ...customParams,
             ...(useToolChannel ? {
-                tools: [{ name: tool.name, description: tool.description, input_schema: tool.schema }],
-                tool_choice: { type: "tool", name: tool.name },
+                tools: [
+                    { name: tool.name, description: tool.description, input_schema: tool.schema },
+                    ...lookupDeclarations.map((entry) => ({ name: entry.name, description: entry.description, input_schema: entry.schema })),
+                ],
+                tool_choice: lookupDeclarations.length && !requireOutputTool ? { type: "any" } : { type: "tool", name: tool.name },
             } : {}),
         };
         const response = await providerFetch(`${endpoint}/messages`, { headers, payload: body, signal });
+        onRequest?.(response.status);
 
         if (RETRYABLE_HTTP_STATUSES.has(response.status)) {
-            if (attempt === retries || !canRetryBeforeDeadline(deadline, retryDelay)) {
-                const payload = await readErrorPayload(response);
-                throw new Error(extractErrorMessage(payload, "The Anthropic-compatible endpoint is busy right now. Try again in a moment."));
-            }
-
-            console.warn(`Anthropic-compatible endpoint is busy. Retrying in ${retryDelay / 1000}s... (attempt ${attempt}/${retries})`);
-            await sleep(retryDelay, signal);
+            await retryOrFailByStatus(response, {
+                attempt, retries, retryDelay, deadline, signal, canFallBack, rateLimitPolicy, providerLabel: "The Anthropic-compatible endpoint",
+            });
             continue;
         }
 
         if (!response.ok) {
             const payload = await readErrorPayload(response);
             const message = extractErrorMessage(payload, `Anthropic-compatible request failed (${response.status})`);
+            const failure = classifyProviderFailure({ status: response.status, payload });
+            if (waitingCannotFix(failure)) throw providerFailureError(message, failure);
             // Honor the model's own max_tokens ceiling (the cap was removed on purpose).
             const capMatch = /max_tokens:\s*\d+\s*>\s*(\d+)/i.exec(message);
             if (response.status === 400 && capMatch && Number(capMatch[1]) > 0
@@ -1767,7 +2118,7 @@ async function callAnthropicCompatible(systemPrompt, history, {
                 console.warn("[ai] Anthropic-compatible refused a streamed request; retrying buffered — long turns may time out.");
                 continue;
             }
-            throw new Error(message);
+            throw refusedRequestError("The Anthropic-compatible endpoint", message, failure);
         }
 
         if (onChunk && !tool && String(response.headers.get("content-type") || "").includes("text/event-stream")) {
@@ -1793,12 +2144,17 @@ async function callAnthropicCompatible(systemPrompt, history, {
         // nothing downstream can tell the difference. Branch on what actually
         // arrived, so an endpoint that ignored stream:true still works.
         const data = String(response.headers.get("content-type") || "").includes("text/event-stream")
-            ? await readAnthropicStreamedResponse(response, onActivity)
-            : await response.json();
+            ? await readAnthropicStreamedResponse(response, onActivity, onToolStream)
+            : await readJsonAnswer(response, "Anthropic Compatible");
         onUsage?.(data);
         if (tool) {
             const toolInput = extractAnthropicToolInput(data, tool);
             if (toolInput) return { rawText: extractAnthropicText(data), toolInput };
+            // Not the answer but a question: the model called lookup functions.
+            if (lookupDeclarations.length) {
+                const lookupCalls = lookupCallsFromAnthropic(data, tool.name);
+                if (lookupCalls.length) return { rawText: extractAnthropicText(data), toolInput: null, lookupCalls };
+            }
 
             // Streaming moved the overload refusal from an HTTP status into an
             // error EVENT on a 200, which the status-code retry above cannot see.
@@ -1820,6 +2176,8 @@ async function callAnthropicCompatible(systemPrompt, history, {
             }
 
             const anthropicText = extractAnthropicText(data);
+            // Still refusing: say so, rather than hand back an empty "answer".
+            if (!anthropicText && data?.error) throw toolStreamRefusalError("Anthropic Compatible", data.error, retriedAfterOverload);
             // No tool call, and what came back is a planning monologue rather
             // than anything a salvage pass could parse. The proxy accepted
             // tool_choice without enforcing it, so asking again more firmly
@@ -1894,6 +2252,132 @@ const conversationShape = (systemPrompt, history) => ({
 
 const elapsedSeconds = (startedAt) => `${((Date.now() - startedAt) / 1000).toFixed(1)}s`;
 
+// Lookup rounds (lookupTools.js, toolTurns.js). A structured task may hand
+// callAI `lookups: { tools, execute, maxRounds?, onRound? }`: the lookup
+// functions are declared beside the task's output function, and when the model
+// calls them instead of answering, each call is answered here (from the live
+// campaign, by the task's executor) and the exchange goes back as the next
+// turns of the same conversation. That repeats until the model calls the
+// output function, or the round budget is spent and the final request is made
+// with only the output function callable. One provider request per round; the
+// system prompt is byte-identical across rounds, so a cached prefix pays off.
+// Three, not more: every round re-sends the whole prompt, and a model that
+// asks one question per round spent seven rounds and three hundred thousand
+// prompt tokens on one jump. The directive tells it to ask everything at once.
+const DEFAULT_LOOKUP_ROUNDS = 3;
+
+// Every round the model spends asking is reported to `onRound` — callAI
+// writes it to the telemetry record and the diagnostics log — so "what did
+// the model look up before it answered" is answerable from the console.
+async function runWithLookups(lookups, history, dispatch, { label, provider, onRound = null }) {
+    const tools = Array.isArray(lookups?.tools) ? lookups.tools.filter((entry) => entry?.name && entry?.schema) : [];
+    if (!tools.length || typeof lookups?.execute !== "function") return dispatch(history, {});
+    const maxRounds = Number.isInteger(lookups.maxRounds) && lookups.maxRounds >= 0 ? lookups.maxRounds : DEFAULT_LOOKUP_ROUNDS;
+    let conversation = Array.isArray(history) ? history : [];
+    let roundStartedAt = Date.now();
+    for (let round = 0; ; round += 1) {
+        const requireOutputTool = round >= maxRounds;
+        if (round > 0) lookups.onRound?.(round);
+        const result = await dispatch(conversation, { lookupTools: tools, requireOutputTool });
+        const calls = Array.isArray(result?.lookupCalls) ? result.lookupCalls : [];
+        // The answer, or a request that could not be turned into one (a final
+        // round still asking questions falls through to the runner's retry).
+        if (!calls.length || result?.toolInput || requireOutputTool) {
+            if (round > 0) {
+                logDebugEvent("ai-call", `${label}: ${provider} answered after ${round} lookup round${round === 1 ? "" : "s"}${result?.toolInput ? "" : " without calling the output function"}.`,
+                    { lookupRounds: lookupRoundCount(conversation), answered: Boolean(result?.toolInput), forcedOutput: requireOutputTool });
+            }
+            return result;
+        }
+        const elapsedMs = Date.now() - roundStartedAt;
+        const results = [];
+        const answered = [];
+        for (const call of calls) {
+            const startedAt = Date.now();
+            let response;
+            try {
+                response = await lookups.execute(call.name, call.args);
+            } catch (error) {
+                response = { error: String(error?.message || error) };
+            }
+            if (response == null || typeof response !== "object" || Array.isArray(response)) response = { result: response ?? null };
+            results.push({ id: call.id, name: call.name, response });
+            answered.push({
+                name: call.name,
+                args: call.args,
+                label: describeLookupCall(call),
+                response: JSON.stringify(response),
+                ms: Date.now() - startedAt,
+                error: typeof response.error === "string" && response.error.length > 0,
+            });
+        }
+        // Always logged: the calls and what they cost, one line. The full
+        // arguments and answers ride along only in detailed mode.
+        logDebugEvent("ai-call", `${label}: lookup round ${round + 1} on ${provider}: ${answered.map((entry) => entry.label).join("; ")}.`, {
+            answers: answered.map((entry) => `${entry.name} ${entry.error ? "ERROR " : ""}${entry.response.length} chars`).join("; "),
+            modelMs: elapsedMs,
+        });
+        logDebugEvent("ai-call", `${label}: lookup round ${round + 1} in full.`, answered.map((entry) => ({
+            call: entry.label, args: entry.args, response: entry.response,
+        })), { verbose: true });
+        try {
+            onRound?.({ round: round + 1, calls: answered, elapsedMs });
+        } catch (error) {
+            console.warn("[ai] a lookup-round observer threw; continuing.", error);
+        }
+        conversation = appendLookupRound(conversation, calls, results);
+        roundStartedAt = Date.now();
+    }
+}
+
+// A call that failed without the provider saying why, because it never reached
+// the provider at all (isUnreachableError).
+const asUnreachable = (error, signal) => {
+    if (error?.providerFailure || signal?.aborted || error?.name === "AbortError") return error;
+    if (isUnreachableError(error)) error.providerFailure = { kind: "busy", reason: "could not be reached" };
+    return error;
+};
+
+// What happened to an entry, in the words a Settings row and a notice use.
+const describeFailure = (entry, failure) => {
+    switch (failure?.kind) {
+    case "spent": return entry.provider === "gemini" ? "has used today's allowance" : "has used its allowance";
+    case "unusable": return `can't be used: ${failure.reason}`;
+    case "rateLimited": return "is rate limited";
+    case "tooBig": return `cannot take a request this size (${failure.reason})`;
+    default: return failure?.reason === "could not be reached" ? "could not be reached" : "is busy";
+    }
+};
+
+// Every mark, into the Diagnostics log with when it clears: a turn answered by
+// three models is otherwise impossible to read back. A request passed over for
+// its size leaves no mark (`state` null): the entry is skipped for this request only.
+function logFallbackMark(label, entry, failure, state) {
+    const clears = !state
+        ? "for this request only"
+        : state.unusable
+            ? "until it is edited"
+            : `until ${formatResetTime(state.spentUntil ?? state.skipUntil)}`;
+    logDebugEvent("ai", `${label}: Fallback list — ${entry.label} ${describeFailure(entry, failure)}; skipped ${clears}.`, {
+        provider: entry.provider,
+        kind: failure.kind,
+        reason: failure.reason || "(none given)",
+    }, { problem: failure.kind === "unusable" });
+}
+
+// Once per switch, not once per call (the runner only reports the entries a
+// call marked itself). The game UI shows it as a short notice.
+// `to` is null when nothing below answered either: the notice then says only
+// what ran out, and the call's own error says the rest.
+function announceFallbackSwitch({ skipped, to }) {
+    const lost = skipped.map(({ entry, failure }) => `${entry.label} ${describeFailure(entry, failure)}`).join("; ");
+    const message = to ? `${lost}. Now using ${to.label}.` : `${lost}.`;
+    logDebugEvent("ai", `Fallback list: ${message}`);
+    try {
+        window.dispatchEvent(new CustomEvent("ai:fallback-switch", { detail: { message } }));
+    } catch { /* no window (tests, the harness) — the log line stands */ }
+}
+
 export async function callAI(systemPrompt, history, opts = {}) {
     // Non-English players get replies in their language at the source —
     // native answers beat post-translating them (see runtime/i18n.js).
@@ -1906,7 +2390,16 @@ export async function callAI(systemPrompt, history, opts = {}) {
     // `__debug` (task, attempt, simulated days) and `__debugSink` (where the
     // task runner wants the record back, to attach the validation outcome)
     // are ours too, and stripped for the same reason.
-    const { languageMode = "ui", logLabel = "", __debug: debugMeta = null, __debugSink: debugSink = null, ...providerOpts } = opts;
+    // `lookups` is ours as well: the loop above runs it, the providers only
+    // ever see the per-round `lookupTools` / `requireOutputTool` it derives.
+    // `requestKind` says whether the player asked for this call or the game made
+    // it in the background, and `onRequest` lets the caller count along (a time
+    // skip reports what it cost): both are for the request budget below.
+    const {
+        languageMode = "ui", logLabel = "", __debug: debugMeta = null, __debugSink: debugSink = null, lookups = null,
+        requestKind = PLAYER_REQUEST, onRequest: observeRequest = null,
+        ...providerOpts
+    } = opts;
     const directive = languageMode === "none" ? ""
         : languageMode === "chat" ? chatLanguageDirective()
         : languageDirective();
@@ -1914,7 +2407,11 @@ export async function callAI(systemPrompt, history, opts = {}) {
         systemPrompt = `${systemPrompt}\n\n${directive}`;
     }
 
-    const provider = getStoredProvider();
+    const entries = getResolvedFallbackList();
+    const preferredEntryId = providerOpts.taskKey ? getTaskPick(providerOpts.taskKey) : "";
+    // Named for where the call STARTS; the answer names who actually answered.
+    const firstChoice = entries.find((entry) => entry.id === preferredEntryId) ?? entries[0];
+    const provider = firstChoice?.provider ?? "(none)";
     const label = logLabel || "AI call";
     const startedAt = Date.now();
     // Telemetry (Settings → AI debug console): one record per call — prompt,
@@ -1933,13 +2430,14 @@ export async function callAI(systemPrompt, history, opts = {}) {
         })
         : null;
     if (debugSink && typeof debugSink === "object") debugSink.record = record;
-    logDebugEvent("ai-call", `${label}: request to ${provider}.`, {
+    const callShape = {
         ...conversationShape(systemPrompt, history),
         streaming: Boolean(providerOpts.onChunk),
         tool: providerOpts.tool?.name || "(none — raw JSON expected)",
+        lookupTools: Array.isArray(lookups?.tools) ? lookups.tools.length : 0,
         maxTokens: providerOpts.maxTokens ?? "(provider maximum)",
         reasoning: getReasoningEnabled(),
-    }, { verbose: true });
+    };
 
     // What the call actually cost, and how long it sat before answering.
     //
@@ -1952,19 +2450,113 @@ export async function callAI(systemPrompt, history, opts = {}) {
     // The timer wraps the caller's own onActivity (runJsonTask passes the idle
     // watchdog's note()), so it observes the first chunk without displacing it.
     const timer = createFirstByteTimer(providerOpts.onActivity);
+    // The request budget (requestBudget.js): every response any provider path
+    // gets is one request against the player's daily allowance, so it is counted
+    // HERE, under the lookup rounds, the retries and the Fallback list, rather
+    // than per call — one callAI can be many requests. The ledger must never
+    // cost a call its answer.
+    const noteRequest = (status) => {
+        try {
+            requestLedger.note({
+                status,
+                kind: requestKind === BACKGROUND_REQUEST ? BACKGROUND_REQUEST : PLAYER_REQUEST,
+                taskKey: debugMeta?.taskKey ?? providerOpts.taskKey ?? (logLabel || "direct"),
+            });
+            observeRequest?.(status);
+        } catch (error) {
+            console.warn("[ai] the request count could not be updated; continuing.", error);
+        }
+    };
+    // Summed across the rounds of a lookup conversation (each round is a
+    // whole request); the latest round's own figure is what a lookup round
+    // is recorded with.
     let usage = null;
+    let roundUsage = null;
+    let lookupRounds = 0;
+    let lookupCalls = 0;
+
+    // The context preflight (contextWindow.js). How big this request is, in
+    // tokens as near as four characters a token can say; an entry whose window
+    // is known to be too small for it is passed over WITHOUT a request, and one
+    // that refuses it teaches its window for next time.
+    const requestTokens = estimateTokens(requestChars({
+        systemPrompt,
+        history,
+        tools: [providerOpts.tool, ...(Array.isArray(lookups?.tools) ? lookups.tools : [])].filter(Boolean),
+    }));
+    const answerReserve = Number(providerOpts.maxTokens) > 0 ? Number(providerOpts.maxTokens) : DEFAULT_ANSWER_RESERVE_TOKENS;
+    const rememberContextWindow = (entry, error) => {
+        const failure = error?.providerFailure;
+        if (failure?.kind !== "tooBig") return;
+        try {
+            const stated = parseContextWindowError(failure.reason);
+            const learned = contextWindows.learn(contextWindowKey(entry), {
+                limitTokens: stated.limitTokens,
+                requestTokens: stated.requestedTokens ?? requestTokens,
+            });
+            logDebugEvent("ai", `${label}: ${entry.label} refused the request as too big for its context window; `
+                + (learned?.limitTokens ? `its window is ${learned.limitTokens} tokens, remembered.` : `a request of ~${requestTokens} tokens is remembered as too big for it.`),
+                { reason: failure.reason, requestTokens }, { problem: true });
+        } catch (memoryError) {
+            console.warn("[ai] the model's context window could not be remembered; continuing.", memoryError);
+        }
+    };
 
     try {
-        const result = await dispatchToProvider(provider, systemPrompt, history, {
-            ...providerOpts,
-            onActivity: timer.note,
-            onUsage: (data) => { usage = normalizeUsage(data) ?? usage; },
-            // The model the provider actually resolved (overrides, discovery).
-            onModel: (model) => { if (record) record.model = String(model ?? ""); },
+        // The Fallback list (fallbackRunner.js): the task's own pick first,
+        // then the list from the top, moving down only past an entry that is
+        // Spent, Unusable or busy — or one this request cannot fit. Each attempt
+        // runs the whole lookup conversation (runWithLookups) against that one entry.
+        const { result, entry: answeredBy } = await runWithFallback({
+            entries,
+            preferredEntryId,
+            store: fallbackStateStore,
+            rateLimitPolicy: getRateLimitPolicy(),
+            onChunk: providerOpts.onChunk,
+            canAttempt: (entry) => contextWindows.refusal(contextWindowKey(entry), requestTokens, { reserveTokens: answerReserve }),
+            tooBigError: (refused) => providerFailureError(
+                nothingFitsMessage(refused.map(({ entry, reason }) => ({ label: entry.label, reason })), requestTokens),
+                { kind: "tooBig", reason: "no entry in the Fallback list can fit this request" },
+            ),
+            attempt: (entry, { canFallBack, onChunk }) => {
+                if (record) record.provider = entry.provider;
+                logDebugEvent("ai-call", `${label}: request to ${entry.label} [${entry.provider}] (~${requestTokens} tokens).`, callShape, { verbose: true });
+                return runWithLookups(lookups, history, (roundHistory, roundOpts) => dispatchToProvider(entry.provider, systemPrompt, roundHistory, {
+                    ...providerOpts,
+                    ...roundOpts,
+                    onChunk,
+                    entrySettings: entry,
+                    canFallBack,
+                    rateLimitPolicy: getRateLimitPolicy(),
+                    onActivity: timer.note,
+                    onRequest: noteRequest,
+                    onUsage: (data) => {
+                        const reported = normalizeUsage(data);
+                        if (!reported) return;
+                        roundUsage = reported;
+                        usage = sumUsage(usage, reported);
+                    },
+                    // The model the provider actually resolved (overrides, discovery).
+                    onModel: (model) => { if (record) record.model = String(model ?? ""); },
+                }).catch((error) => { rememberContextWindow(entry, error); throw asUnreachable(error, providerOpts.signal); }), {
+                    label,
+                    provider: entry.provider,
+                    onRound: ({ round, calls, elapsedMs }) => {
+                        lookupRounds = round;
+                        lookupCalls += calls.length;
+                        attachLookupRound(record, { round, calls, elapsedMs, usage: roundUsage });
+                        roundUsage = null;
+                    },
+                });
+            },
+            onMark: ({ entry, failure, state }) => logFallbackMark(label, entry, failure, state),
+            onSwitch: announceFallbackSwitch,
+            formatTime: formatResetTime,
         });
-        logDebugEvent("ai-call", `${label}: ${provider} answered in ${elapsedSeconds(startedAt)}.`, {
+        logDebugEvent("ai-call", `${label}: ${answeredBy.label} [${answeredBy.provider}] answered in ${elapsedSeconds(startedAt)}.`, {
             replyChars: typeof result === "string" ? result.length : String(result?.rawText ?? "").length,
             viaToolCall: Boolean(result?.toolInput),
+            ...(lookupRounds ? { lookupRounds, lookupCalls } : {}),
             // Omitted rather than zeroed when unknown: a buffered call never
             // fires onActivity, and plenty of gateways report no usage at all.
             ...(timer.firstByteMs === null ? {} : { firstByteMs: timer.firstByteMs }),
@@ -1987,7 +2579,7 @@ export async function callAI(systemPrompt, history, opts = {}) {
         // failure at all: the player pressed the button.
         const cancelled = error?.name === "AbortError";
         logDebugEvent("ai-call",
-            `${label}: ${provider} ${cancelled ? "call cancelled" : "call FAILED"} after ${elapsedSeconds(startedAt)}.`,
+            `${label}: ${cancelled ? "call cancelled" : "call FAILED"} after ${elapsedSeconds(startedAt)}${error?.fallbackUnavailable ? " — nothing in the Fallback list can answer" : ""}.`,
             error,
             { verbose: cancelled });
         attachCallMetrics(record, { usage, firstByteMs: timer.firstByteMs });
@@ -2109,14 +2701,10 @@ ${forcePosture}`;
 // button that places the unit, instead of the player reading coordinates off the
 // screen and clicking the map themselves. Appended at call time for the same
 // frozen-prompt reason as the two directives above.
-// What the player can actually do with a formation differs between the two unit
-// systems, and the advisor must not offer what the UI cannot deliver: in beta
-// there is no manual movement or combat at all, while classic is the wargame
-// where the player marches and fights their own units.
-const buildAdvisorDeployDirective = (betaUnits) => `[Placing Forces]
-The player can place their own formations on the map${betaUnits
-    ? "; they cannot move or fight them, so never offer to march or attack with anything"
-    : ", and can move and attack with them directly"}. When you specifically recommend placing a NEW formation of theirs somewhere, and you know where, append a fenced \`\`\`deploy block after your normal prose (never instead of it) containing a JSON array with one entry per recommended deployment: {"type":"infantry|armor|air|naval|artillery|garrison","name":"<what to call it>","composition":"<what it is made of, e.g. 2 frigates>","strength":<1-100, percent of established strength>,"lng":<real longitude>,"lat":<real latitude>}.
+// The advisor must not offer what the UI cannot deliver: the player places
+// formations and states intent for them, and never moves or fights them by hand.
+const ADVISOR_DEPLOY_DIRECTIVE = `[Placing Forces]
+The player can place their own formations on the map; they cannot move or fight them, so never offer to march or attack with anything. When you specifically recommend placing a NEW formation of theirs somewhere, and you know where, append a fenced \`\`\`deploy block after your normal prose (never instead of it) containing a JSON array with one entry per recommended deployment: {"type":"infantry|armor|air|naval|artillery|garrison","name":"<what to call it>","composition":"<what it is made of, e.g. 2 frigates>","strength":<1-100, percent of established strength>,"lng":<real longitude>,"lat":<real latitude>}.
 Use real coordinates for the place you are actually recommending — 0,0 is open ocean and is never valid. Omit the block entirely unless you are recommending a specific placement at a specific place; most replies need none, and a general discussion of strategy is not a deployment. Anything the player places is a REQUEST: the simulation confirms, repositions or rejects it, so say so rather than promising it will stand.
 
 Example:
@@ -2233,9 +2821,19 @@ Example:
 [Current Projects & Operations]
 ${projectsSummary}`;
 
+// The conversation rides as the message turns, and only there. It used to be
+// rendered into the system prompt as well (ALL_ADVISOR_MESSAGES for the advisor,
+// THIS_CHAT_HISTORY for a leader): the same transcript twice in every request,
+// ~20 K characters of an advisor message on a real save. Worse, it sat near the
+// END of the system prompt, so everything after it changed with every message
+// and no provider's prefix cache could reuse the ~40 K of directives behind it.
+// Both builders below serve only callers that send the conversation as turns;
+// the template keeps its sentence, and this is what now stands in it.
+export const CONVERSATION_IN_TURNS = "(given below as the message turns, oldest first; the newest message is the last one)";
+
 async function buildAdvisorSystemPrompt() {
     await ensurePromptsLoaded();
-    const [gameData, actionData, chatData, worldData, eventData, advisorData] = await Promise.all([
+    const [savedGame, actionData, savedChats, savedWorld, savedEvents, advisorData] = await Promise.all([
         readJson(JSON_URLS.game, { defaultValue: {} }),
         readJson(JSON_URLS.actions, { defaultValue: [] }),
         readJson(JSON_URLS.chat, { defaultValue: [] }),
@@ -2243,30 +2841,51 @@ async function buildAdvisorSystemPrompt() {
         readJson(JSON_URLS.events, { defaultValue: [] }),
         readJson(JSON_URLS.advisor, { defaultValue: [] }),
     ]);
-
-    const variables = await buildPromptVariables({
-        actionData,
-        advisorData,
-        chatData,
-        eventData,
-        gameData,
-        worldData,
+    // While a skip is being revealed, the advisor knows what the player has been
+    // shown and no more (runtime/unseenEvents.js): an event still to come — or
+    // one Intervene may yet discard — is not something its staff can speak of.
+    const { game: gameData, chats: chatData, world: worldData, events: eventData } = await viewAsSeen({
+        game: savedGame, chats: savedChats, world: savedWorld, events: savedEvents,
     });
+
+    const variables = {
+        ...(await buildPromptVariables({
+            actionData,
+            advisorData,
+            chatData,
+            eventData,
+            gameData,
+            worldData,
+        })),
+        advisorMessages: CONVERSATION_IN_TURNS,
+    };
     const helperValues = resolveHelperValues(promptPack.helpers, variables);
 
-    const rendered = renderTemplate(promptPack.advisor, { ...variables, ...helperValues });
-    // The forces directive is beta-only — promptContext leaves forcePosture empty
-    // in the classic system rather than paying for the territory index, so the
-    // heading would introduce a section with nothing under it.
-    const betaUnits = isBetaUnits();
+    // The briefing and the rules also ride inside the world summary; keep one
+    // copy of each, as runJsonTask does for the gameplay tasks.
+    const rendered = collapseRepeatedWorldContext(
+        renderTemplate(promptPack.advisor, { ...variables, ...helperValues }),
+        variables,
+    );
     const directives = [
         buildAdvisorActionsDirective(variables.plannedActionsWithIds),
         ADVISOR_MESSAGE_DRAFT_DIRECTIVE,
-        buildAdvisorDeployDirective(betaUnits),
+        ADVISOR_DEPLOY_DIRECTIVE,
         buildAdvisorProjectsDirective(variables.projectsSummary),
-        ...(betaUnits ? [buildAdvisorForcesDirective(variables.forcePosture)] : []),
+        buildAdvisorForcesDirective(variables.forcePosture),
+        // The government's papers (runtime/reportDelivery.js): what reached it
+        // through its diplomats, its agents and the news. The file the player
+        // no longer browses; the advisor, as the government's staff, reads it.
+        describeDocumentsForAdvisor(worldData?.reports, gameData?.country),
+        // The player's standing goal (runtime/playerGoal.js): the direction the
+        // advice serves. The advisor's alone of the conversations — a leader is
+        // never told a government's aims.
+        describeGoalForAdvisor(playerGoalOf(worldData, gameData?.country)),
+        // The Game Master's standing reminders (runtime/gmChanges.js): what is
+        // true now, whatever the record says. Empty — and so absent — without any.
+        renderReminders(worldData?.simulationReminders, { formatDate: formatDateReadable }),
         ADVISOR_FORMATTING_DIRECTIVE,
-    ];
+    ].filter(Boolean);
     return `${rendered}\n\n${directives.join("\n\n")}`;
 }
 
@@ -2276,10 +2895,14 @@ async function buildAdvisorSystemPrompt() {
 // old "first non-player participant" guess would have shown one member's private
 // correspondence to another. Callers that genuinely have no speaker yet may omit
 // it and keep the old derivation.
-export async function buildDiplomaticSystemPrompt(countries, playerCountry, speakingAs = "") {
+//
+// `chatId` names the thread being answered. That thread rides as the turns, so
+// it is left out of the digest of the speaker's other chats as well — it used
+// to appear there too, a second copy that changed with every message.
+export async function buildDiplomaticSystemPrompt(countries, playerCountry, speakingAs = "", { chatId = "" } = {}) {
     await ensurePromptsLoaded();
     const participantList = countries.map((country) => `- ${country}`).join("\n");
-    const [gameData, actionData, chatData, worldData, eventData, advisorData] = await Promise.all([
+    const [savedGame, actionData, savedChats, savedWorld, savedEvents, advisorData] = await Promise.all([
         readJson(JSON_URLS.game, { defaultValue: {} }),
         readJson(JSON_URLS.actions, { defaultValue: [] }),
         readJson(JSON_URLS.chat, { defaultValue: [] }),
@@ -2287,27 +2910,42 @@ export async function buildDiplomaticSystemPrompt(countries, playerCountry, spea
         readJson(JSON_URLS.events, { defaultValue: [] }),
         readJson(JSON_URLS.advisor, { defaultValue: [] }),
     ]);
+    // A leader answering the player mid-reveal speaks from the world the player
+    // has been shown (runtime/unseenEvents.js), not the one the turn finished.
+    const { game: gameData, chats: chatData, world: worldData, events: eventData } = await viewAsSeen({
+        game: savedGame, chats: savedChats, world: savedWorld, events: savedEvents,
+    });
 
     // A leader only knows the conversations they are actually in. The leader
     // prompt carries the recent chat history, and this used to hand it EVERY
     // chat — so the polity answering here could see, and react to, what the
     // player had said to someone else. Diplomacy with others is private; the
     // only way to learn it is the spy the game now lets the player plant.
-    const isParticipant = (chat) => (Array.isArray(chat?.countries) ? chat.countries : [])
-        .some((country) => [country?.name, country?.code].map((v) => String(v ?? "").trim().toUpperCase())
-            .includes(String(speakingAs).trim().toUpperCase()));
-    const ownChats = Array.isArray(chatData) ? chatData.filter(isParticipant) : [];
+    //
+    // One rule, in chatVisibility.js — the same matcher promptContext applies
+    // again on the way into the transcript. The speaker is settled FIRST, so
+    // the filter never runs against a blank name: with no speaker at all a
+    // leader is shown no chats, never all of them.
+    const speaker = speakingAs || countries.find((country) => country !== playerCountry) || "";
+    const chats = Array.isArray(chatData) ? chatData : [];
+    const ownChats = speaker ? filterChatsVisibleTo(chats, speaker) : [];
+    const threadId = String(chatId || "");
+    const otherOwnChats = threadId ? ownChats.filter((chat) => String(chat?.id || "") !== threadId) : ownChats;
     const variables = {
         ...(await buildPromptVariables({
             actionData,
             advisorData,
-            chatData: ownChats,
+            chatData: otherOwnChats,
             eventData,
             gameData,
-            speakingAs: speakingAs || countries.find((country) => country !== playerCountry) || "",
+            speakingAs: speaker,
             worldData,
         })),
         chatParticipants: participantList || "",
+        // The thread itself rides as the turns (see CONVERSATION_IN_TURNS). It
+        // also stops this prompt naming the WRONG thread: the variable took the
+        // speaker's most recently active chat, which need not be this one.
+        chatHistory: CONVERSATION_IN_TURNS,
     };
     const helperValues = resolveHelperValues(promptPack.helpers, variables);
 
@@ -2316,7 +2954,7 @@ export async function buildDiplomaticSystemPrompt(countries, playerCountry, spea
     // player has with everyone else, and the player's queued plans — redacted by
     // that polity's service against the player's. A polity whose agent has been
     // turned gets the cover story the player wrote instead, and believes it.
-    const otherChats = Array.isArray(chatData) ? chatData.filter((chat) => !isParticipant(chat)) : [];
+    const otherChats = speaker ? chats.filter((chat) => !isChatVisibleTo(chat, speaker)) : chats;
     const stolen = [
         ...otherChats.slice(-4).map((chat) => {
             const who = (chat.countries || []).map((c) => c?.name).filter(Boolean).join(", ");
@@ -2328,8 +2966,31 @@ export async function buildDiplomaticSystemPrompt(countries, playerCountry, spea
     const agent = foreignAgentBrief(worldData, speakingAs, { playerPolity: playerCountry || gameData?.country || "", material: stolen });
     const espionage = agent ? "\n\n[Your Intelligence]\n" + agent : "";
 
+    // One copy each of the briefing and the rules (see buildAdvisorSystemPrompt).
+    const rendered = collapseRepeatedWorldContext(
+        renderTemplate(promptPack.leader, { ...variables, ...helperValues }),
+        variables,
+    );
+
+    // The Game Master's standing reminders bind a leader too: a leader told the
+    // bridge is down does not offer to meet on it.
+    const reminders = renderReminders(worldData?.simulationReminders, { formatDate: formatDateReadable });
+
+    // The documents this leader's government holds (runtime/reports.js), by the
+    // same audience rule as everything it may read: its own, and what was
+    // published. Never who else stole a copy.
+    const speakerKey = String(speaker || "").trim().toLowerCase();
+    const papers = speakerKey
+        ? describeReportsForPrompt(normalizeReports(worldData?.reports), {
+            sees: (visibleTo) => visibleTo === null || visibleTo.some((name) => String(name).trim().toLowerCase() === speakerKey),
+            heading: "[Documents Your Government Holds]",
+            limit: 8,
+            bodyChars: 220,
+        })
+        : "";
+
     // Leaders negotiate as softly or ruthlessly as the chosen difficulty.
-    return `${renderTemplate(promptPack.leader, { ...variables, ...helperValues })}${espionage}\n\n${difficultyDirective(gameData?.difficulty)}`;
+    return `${rendered}${espionage}${papers ? `\n\n${papers}` : ""}${reminders ? `\n\n${reminders}` : ""}\n\n${difficultyDirective(gameData?.difficulty)}`;
 }
 
 let advisorHistory = [];
@@ -2359,9 +3020,13 @@ function compactConversationHistory(history) {
     ];
 }
 
-export async function sendMessage(userMessage, opts) {
+// `catchUp` is the note the advisor panel wrote for this message when the world
+// moved on since the last exchange (conversationCatchUp.js). The model reads it
+// ahead of what the player typed; it goes no further than this history.
+export async function sendMessage(userMessage, options) {
+    const { catchUp = "", ...opts } = options || {};
     const systemPrompt = await buildAdvisorSystemPrompt();
-    advisorHistory.push({ role: "user", parts: [{ text: userMessage }] });
+    advisorHistory.push({ role: "user", parts: [{ text: withCatchUp(userMessage, catchUp) }] });
     advisorHistory = compactConversationHistory(advisorHistory);
 
     // Both halves of the exchange, in full, in detailed mode. The question is
@@ -2398,7 +3063,9 @@ export function loadHistory(savedMessages) {
     .filter((msg) => msg.role === "user" || msg.role === "advisor")
     .map((msg) => ({
         role: msg.role === "user" ? "user" : "model",
-        parts: [{ text: msg.text }],
+        // A player's message is sent with the catch-up note it was first sent
+        // with, so a reloaded conversation reads exactly as the live one did.
+        parts: [{ text: msg.role === "user" ? withCatchUp(msg.text, msg.catchUp) : msg.text }],
     }));
     advisorHistory = compactConversationHistory(advisorHistory);
     // Error bubbles are filtered out above, so the count the model resumes with
@@ -2415,6 +3082,11 @@ export function startChat() {
 }
 
 let diplomaticHistory = [];
+// A stored thread message as the leader is sent it: a player's line with the
+// catch-up it carried ahead of it (conversationCatchUp.js), anything else as is.
+const withCatchUpOn = (msg) => (msg?.role === "user" && msg.catchUp
+    ? { ...msg, text: withCatchUp(msg.text, msg.catchUp) }
+    : msg);
 // The open thread's durable memory (the newest DIPLOMATIC_MEMORY a reply
 // carried) and the game date it runs through.
 let diplomaticMemorySummary = "";
@@ -2438,7 +3110,9 @@ export function loadDiplomaticHistory(savedMessages) {
     diplomaticHistory = saved
     .map((msg) => ({
         role: msg.role === "user" ? "user" : "model",
-        parts: [{ text: formatDiplomaticTranscriptEntry(msg, formatDateReadable) }],
+        // A player's line is sent with the catch-up it was first sent with, so a
+        // reopened thread reads exactly as the live one did.
+        parts: [{ text: formatDiplomaticTranscriptEntry(withCatchUpOn(msg), formatDateReadable) }],
     }));
     diplomaticHistory = compactConversationHistory(diplomaticHistory);
     logDebugEvent("diplomacy",
@@ -2454,14 +3128,19 @@ const participantLabel = (countries) => (Array.isArray(countries) ? countries : 
     .filter(Boolean)
     .join(", ") || "(no participants)";
 
-export async function sendDiplomaticMessage(playerMessage, speakingAs, countries, opts) {
+export async function sendDiplomaticMessage(playerMessage, speakingAs, countries, options) {
     // speakingAs is passed through now (it used to be dropped, leaving the prompt
     // to guess "first participant" — which with a null playerCountry could pick
     // the PLAYER). It selects this turn's voice and gates which chats that polity
-    // may have read.
-    const freshPrompt = await buildDiplomaticSystemPrompt(countries, null, speakingAs);
+    // may have read. `chatId` is the thread's own, and goes no further than the
+    // prompt builder.
+    // `catchUp` is what the world did since this thread last spoke, written by
+    // the panel and kept on the player's message (conversationCatchUp.js
+    // buildThreadCatchUp); the leader reads it ahead of what the player typed.
+    const { chatId = "", catchUp = "", ...opts } = options || {};
+    const freshPrompt = await buildDiplomaticSystemPrompt(countries, null, speakingAs, { chatId });
 
-    diplomaticHistory.push({ role: "user", parts: [{ text: playerMessage }] });
+    diplomaticHistory.push({ role: "user", parts: [{ text: withCatchUp(playerMessage, catchUp) }] });
     diplomaticHistory = compactConversationHistory(diplomaticHistory);
 
     const turnInstruction = buildDiplomaticTurnInstruction({ speakingAs, priorMemory: diplomaticMemorySummary });
@@ -2518,15 +3197,15 @@ export async function sendDiplomaticMessage(playerMessage, speakingAs, countries
 // chat a ConversationView currently has open in the Diplomacy panel — reusing
 // it here would splice this unrelated exchange into whatever chat the player
 // happens to be mid-reading.
-export async function sendDiplomaticMessageOnceOff({ playerMessage, speakingAs, participantNames, playerCountry, priorMessages = [], opts }) {
-    const freshPrompt = await buildDiplomaticSystemPrompt(participantNames, playerCountry, speakingAs);
+export async function sendDiplomaticMessageOnceOff({ playerMessage, speakingAs, participantNames, playerCountry, priorMessages = [], chatId = "", opts }) {
+    const freshPrompt = await buildDiplomaticSystemPrompt(participantNames, playerCountry, speakingAs, { chatId });
 
     const priorMemory = latestSavedDiplomaticMemory(priorMessages);
     let history = priorMessages
         .filter((msg) => ["user", "leader"].includes(msg.role))
         .map((msg) => ({
             role: msg.role === "user" ? "user" : "model",
-            parts: [{ text: formatDiplomaticTranscriptEntry(msg, formatDateReadable) }],
+            parts: [{ text: formatDiplomaticTranscriptEntry(withCatchUpOn(msg), formatDateReadable) }],
         }));
     history = compactConversationHistory(history);
     history.push({ role: "user", parts: [{ text: playerMessage }] });
@@ -2574,7 +3253,20 @@ export async function sendDiplomaticMessageOnceOff({ playerMessage, speakingAs, 
 // gateways — takes the normal synchronous call. A submission that fails for any
 // reason also falls back; batching must never break a task. Opt-in from
 // Settings → Batch background AI tasks; gameplay.js checks that switch.
-export const providerSupportsBatch = (provider = getStoredProvider()) => provider === "anthropic";
+//
+// With a Fallback list, batching is decided by the entry the task would START
+// on: the task's own pick if it has one, else the first entry that can answer.
+// A task that batches is answered by that entry alone — batching has no way to
+// fall back mid-request — and a refused submission runs the task synchronously,
+// through the list as usual.
+const batchEntryFor = (taskKey) => {
+    const entries = getResolvedFallbackList();
+    const pick = taskKey ? getTaskPick(taskKey) : "";
+    const ready = (entry) => getEntryStatus(entry.id).status === "ready";
+    return entries.find((entry) => entry.id === pick && ready(entry)) ?? entries.find(ready) ?? null;
+};
+
+export const providerSupportsBatch = (taskKey) => batchEntryFor(taskKey)?.provider === "anthropic";
 
 const anthropicBatchHeaders = (apiKey) => ({
     "x-api-key": apiKey,
@@ -2583,24 +3275,25 @@ const anthropicBatchHeaders = (apiKey) => ({
 });
 
 // The provider's batch id is what retrieval polls; the custom id names our
-// request inside it. In memory, like the registry in gameplay.js.
-const pendingBatchIds = new Map(); // customId -> provider batch id
+// request inside it. In memory, like the registry in gameplay.js. The key rides
+// along because retrieval must ask the same account that was sent the batch.
+const pendingBatchIds = new Map(); // customId -> { batchId, apiKey }
 
 // Resolves to { customId } when the batch was accepted, null when batching is
 // unavailable or the submission was refused — the caller then runs the task
 // synchronously.
 export async function submitAIBatch({ customId, systemPrompt, history, taskKey, tool }) {
-    if (!providerSupportsBatch()) return null;
-    const settings = getProviderSettings("anthropic");
-    const apiKey = settings.apiKey.trim();
+    const entry = batchEntryFor(taskKey);
+    if (entry?.provider !== "anthropic") return null;
+    const apiKey = entry.apiKey.trim();
     if (!apiKey) return null;
 
     let model;
     try {
         model = await resolveModel("anthropic", {
+            entrySettings: entry,
             fallbackModel: ANTHROPIC_DEFAULT_MODEL,
             providerLabel: "Anthropic",
-            taskKey,
         });
     } catch {
         return null;
@@ -2646,7 +3339,7 @@ export async function submitAIBatch({ customId, systemPrompt, history, taskKey, 
         const batch = await response.json();
         const batchId = String(batch?.id ?? "").trim();
         if (!batchId) return null;
-        pendingBatchIds.set(customId, batchId);
+        pendingBatchIds.set(customId, { batchId, apiKey });
         logDebugEvent("ai-call", `Batch submission for "${taskKey}" accepted as ${batchId}.`);
         return { customId, batchId, record };
     } catch (error) {
@@ -2661,9 +3354,7 @@ export async function submitAIBatch({ customId, systemPrompt, history, taskKey, 
 // answered in text — the caller parses rawText); validation and application
 // stay with the caller.
 export async function retrieveAIBatch(customId) {
-    const batchId = pendingBatchIds.get(customId);
-    const settings = getProviderSettings("anthropic");
-    const apiKey = settings.apiKey.trim();
+    const { batchId, apiKey } = pendingBatchIds.get(customId) ?? {};
     if (!batchId || !apiKey) return { status: "failed", payload: null, rawText: "" };
     const headers = anthropicBatchHeaders(apiKey);
 

@@ -1,4 +1,4 @@
-/*! Open Historia — portions (OpenCode Zen model selection) © 2026 Nicholas Krol, MIT (see src/Editor/LICENSE). */
+/*! Open Historia — portions (OpenCode Zen model selection) © 2026 Nicholas Krol, AGPL-3.0-or-later (see LICENSE). */
 
 export const OPENCODE_ZEN_ENDPOINT = "https://opencode.ai/zen/v1";
 

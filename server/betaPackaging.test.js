@@ -1,4 +1,4 @@
-/*! Open Historia — beta packaging consistency tests © 2026 Nicholas Krol, MIT (see src/Editor/LICENSE). */
+/*! Open Historia — beta packaging consistency tests © 2026 Nicholas Krol, AGPL-3.0-or-later (see LICENSE). */
 // Run: node --test server/betaPackaging.test.js
 //
 // The beta desktop build is described in four places that have to agree and that
@@ -115,10 +115,40 @@ test("the workflow publishes the feed files electron-updater reads", () => {
   // Without latest*.yml at the tag, `publish` in the config points at nothing:
   // the banner still appears, pressing update fails, and nothing in CI notices.
   const files = workflow.match(/^\s*files=\((.+)\)\s*$/m)?.[1] ?? "";
-  assert.match(files, /release\/latest\*\.yml/);
+  const feeds = workflow.match(/^\s*feeds=\((.+)\)\s*$/m)?.[1] ?? "";
+  assert.match(feeds, /release\/latest\*\.yml/);
   assert.match(files, /release\/\*\.exe(?!\.)/);
   assert.match(files, /release\/\*-mac-\*\.zip/);
   assert.match(files, /release\/\*\.AppImage/);
+  // The feeds announce the build; the installers are what they point at. They
+  // go up in that order — installers first — or a tester who presses Update
+  // while the installer is still uploading downloads a 404.
+  const uploads = [...workflow.matchAll(/gh release upload "\$TAG" "\$\{(files|feeds)\[@\]\}"/g)].map((match) => match[1]);
+  assert.deepEqual(uploads, ["files", "feeds"], "installers must be uploaded before the feed files");
+});
+
+test("the beta build stamps its own package name", () => {
+  // electron-builder derives the updater cache folder (<name>-updater) and the
+  // .deb package name from package.json's `name`, and nothing else renames them:
+  // both installed apps on a tester's machine were reading and cleaning the same
+  // %LOCALAPPDATA%\open-historia-updater\pending.
+  const stamped = workflow.match(/p\.name='([^']+)'/)?.[1];
+  assert.ok(stamped, "the workflow does not stamp package.json's name");
+
+  // Compared against main.cjs, NOT against packageJson.name. The workflow's own
+  // "Stamp the app version" step rewrites package.json's name to the stamped
+  // value, and it runs BEFORE "Run the tests" — so in CI the two are equal by
+  // construction and this assertion could only ever fail there while passing on
+  // every developer's clean tree. It did exactly that, in run 33989433938.
+  //
+  // STABLE_LIBRARY_NAME is the same string, is load-bearing rather than
+  // decorative (it names the %APPDATA% folder the beta shares the world map
+  // from), and nothing in the pipeline touches it. A rename that updated one and
+  // not the other is worth failing on.
+  const stableName = mainCjs.match(/STABLE_LIBRARY_NAME\s*=\s*"([^"]+)"/)?.[1];
+  assert.ok(stableName, "electron/main.cjs no longer names the stable library");
+  assert.notEqual(stamped, stableName, "the beta would share the stable app's updater cache and deb name");
+  assert.match(stamped, /^[a-z0-9-]+$/, "not a name electron-builder can use as a folder and a deb package");
 });
 
 test("the beta packages exactly what the stable build packages", () => {

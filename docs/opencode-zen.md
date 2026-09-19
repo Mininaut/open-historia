@@ -12,10 +12,10 @@ OpenCode Zen gives Open Historia access to free and paid AI models. **Start with
 ## 2. Paste it into the game
 
 1. Use the **Open Historia desktop app** or run the game on **your own local server**.
-2. Open the game menu → **Settings → AI** and choose **OpenCode Zen**.
+2. Open the game menu → **Settings → AI → Connections**, add a connection and choose **OpenCode Zen**.
 3. Paste the secret into **OpenCode Zen API Key**.
 4. Leave **Enable paid Zen models** switched **off**.
-5. Click **Load models**, then choose a model in **Free tier**. Alternatively, leave **Model** empty: the game looks up the current catalogue and selects a supported free model. It will not fall back to a paid model.
+5. Add an entry to the **Fallback list** using this connection. In that entry, click **Load models**, then choose a model in **Free tier**. Alternatively, leave **Model** empty: the game looks up the current catalogue and selects a supported free model. Move the entry to the top to use it first.
 6. Settings save automatically in this browser/app profile. Return to the game, open the advisor and send a short message such as “Hello”. This tests actual generation. **Loading the catalogue does not validate your key or balance.**
 
 The address is built in: `https://opencode.ai/zen/v1`. Do not substitute the Go address (`/zen/go/v1`). Keys remain in the same browser-local settings storage used by the other providers. Requests go directly to OpenCode, with the existing relay on **your local game server** used if necessary. No new hosted proxy is involved.
@@ -26,9 +26,9 @@ The address is built in: `https://opencode.ai/zen/v1`. Do not substitute the Go 
 
 - **Go** is an OpenCode subscription with its own endpoint and allowance.
 - **Zen** has its own free offers and pay-as-you-go billing. A key used with Go may also access Zen free models, but **a Go subscription does not pay for Zen paid-model requests**.
-- Paid Zen models are blocked in the game by default, including per-task model overrides and a `model` override in custom JSON.
+- Paid Zen models are blocked per connection by default, including fallback entries, per-task picks and a `model` override in custom JSON. Enabling paid models on one Zen connection does not enable them on another.
 - To deliberately use a paid model: check **Zen Billing** in your OpenCode workspace, add credit if needed, set a spending limit, turn on **Enable paid Zen models**, and explicitly choose the desired model.
-- Even after enabling paid models, leaving **Model** blank still auto-selects only a free model. An unavailable free model is never silently replaced with a paid one.
+- Even after enabling paid models, leaving **Model** blank still auto-selects only a free model. The fallback list may try another entry you configured when one cannot answer; a paid Zen entry still requires its connection's explicit opt-in.
 - The free label comes from Zen's published free model IDs/offers; it is **not a live price quote** or a promise of unlimited access. Check [current pricing](https://opencode.ai/docs/zen/#pricing).
 
 ## Supported models
@@ -59,8 +59,8 @@ For advanced use, the provider supports per-task models, custom request paramete
 
 1. Откройте [OpenCode](https://opencode.ai/auth), войдите или зарегистрируйтесь.
 2. В рабочем пространстве откройте **API Keys → Create API Key**, назовите ключ **Open Historia** и создайте его. Скопируйте весь секретный ключ, а не его название и не пароль от аккаунта.
-3. В **настольной игре** откройте **Settings → AI → OpenCode Zen** и вставьте ключ в **OpenCode Zen API Key**. Настройки сохраняются автоматически.
-4. Переключатель **Enable paid Zen models** оставьте **выключенным**. Нажмите **Load models** и выберите модель из **Free tier**. Можно оставить поле **Model** пустым — игра попробует выбрать доступную бесплатную модель сама. На платную она сама не переключится.
+3. В **настольной игре** откройте **Settings → AI → Connections**, добавьте подключение **OpenCode Zen** и вставьте ключ в **OpenCode Zen API key**. Настройки сохраняются автоматически.
+4. Переключатель **Enable paid Zen models** оставьте **выключенным**. Добавьте запись с этим подключением в **Fallback list** и переместите её наверх. В записи нажмите **Load models** и выберите модель из **Free tier**. Пустое поле **Model** автоматически выбирает бесплатную модель; платные модели Zen требуют явного разрешения для своего подключения.
 5. Вернитесь в игру и отправьте советнику короткое «Привет». Загрузка списка моделей сама по себе **не проверяет** ключ и баланс.
 
 **Подписка Go и баланс Zen — разные вещи.** Ключ аккаунта с Go может работать на бесплатных моделях Zen, но подписка не оплачивает платные запросы Zen. Для платных моделей отдельно проверьте **Zen Billing**, пополните баланс при необходимости, установите лимит расходов и только затем включайте платные модели в игре.

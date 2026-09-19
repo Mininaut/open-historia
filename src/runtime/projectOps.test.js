@@ -1,4 +1,4 @@
-/*! Open Historia — portions (project op application tests) © 2026 Nicholas Krol, MIT (see src/Editor/LICENSE). */
+/*! Open Historia — portions (project op application tests) © 2026 Nicholas Krol, AGPL-3.0-or-later (see LICENSE). */
 // Needs node_modules: gameState.js reaches assets.js, which imports maplibre-gl.
 // Run with `npm ci && node --test src/runtime/projectOps.test.js`. The pure
 // derived-state helpers are tested separately in projects.test.js, which stays
@@ -76,6 +76,21 @@ test("a restatement that means to change things still can", () => {
 test("an explicitly emptied list is still an instruction, not an omission", () => {
   const before = open()[0];
   assert.deepEqual(applyProjectOps([before], [{ op: "create", name: before.name, tags: [] }], {})[0].tags, []);
+});
+
+// The board prompt titles entries `Operation "Name"`, and a model copies the whole
+// title — label, quotes, and in a Russian game a translated label. Without an id
+// that update used to match nothing and vanish.
+test("an op naming a project by its displayed title still finds it", () => {
+  const before = applyProjectOps([], [{ op: "create", name: "Standing Watch", kind: "operation", summary: "s" }], {})[0];
+  for (const name of ['Operation "Standing Watch"', 'Операция "Standing Watch"', 'Operation «Standing Watch»']) {
+    const after = applyProjectOps([before], [{ op: "update", name, progress: 70 }], {});
+    assert.equal(after.length, 1, name);
+    assert.equal(after[0].progress, 70, name);
+  }
+  // The label may already be part of the name, in which case the prompt quotes the whole thing.
+  const labelled = applyProjectOps([], [{ op: "create", name: "Operation Kingfisher", kind: "operation", summary: "s" }], {})[0];
+  assert.equal(applyProjectOps([labelled], [{ op: "update", name: '"Operation Kingfisher"', progress: 40 }], {})[0].progress, 40);
 });
 
 test("a genuinely new project still receives its defaults", () => {
@@ -333,15 +348,16 @@ test("an onComplete carrying nothing usable normalizes to null, not an empty bag
 // The actual issue-#7 regression. Note the assertion on the KEY: polityOverrides
 // is keyed by the polity's stable identity and the new name is a display layer,
 // so a rename that moved the key would split one country into two.
-test("completing a project applies its onComplete rename under the ORIGINAL key", () => {
+test("completing a project applies its onComplete rename, which re-keys the country", () => {
   const world = worldWith(applyProjectOps([], [annexation(renameRuritania)]));
   const { world: next } = applyEventImpactsToWorld({
     events: [eventWith([{ op: "complete", name: "Northern Question", note: "Done." }])],
     world,
   });
 
-  assert.equal(next.polityOverrides.Ruritania.name, "Federal Republic of Ruritania");
-  assert.equal("Federal Republic of Ruritania" in next.polityOverrides, false, "the key must not move");
+  assert.equal(next.polityOverrides["Federal Republic of Ruritania"].name, "Federal Republic of Ruritania");
+  assert.equal("Ruritania" in next.polityOverrides, false, "the country is keyed by its new name");
+  assert.deepEqual(next.polityOverrides["Federal Republic of Ruritania"].formerNames, ["Ruritania"]);
   assert.equal(next.projects[0].status, "complete");
   assert.ok(next.projects[0].onCompleteAppliedAt, "the latch must be stamped");
 });
@@ -359,6 +375,24 @@ test("replaying the same completion does not apply the effects twice", () => {
   const { world: twice } = applyEventImpactsToWorld({ events: [event], world: once });
   assert.equal(twice.regionOwnershipOverrides["RUR.1_1"], "Someone Else", "the transfer fired a second time");
   assert.equal(twice.projects[0].onCompleteAppliedAt, stamped);
+});
+
+// A Hidden event (a Canonical event kept off the timeline) still moves the Board,
+// through this same path so a completion releases its effects exactly as a
+// visible event's would — but it is not on the timeline, so it must not be
+// stamped into the entry's activity, which lists timeline events only.
+test("a board-only event completes a project and releases its effects without stamping its activity", () => {
+  const world = worldWith(applyProjectOps([], [annexation(renameRuritania)]));
+  const hiddenCarrier = { ...eventWith([{ op: "complete", name: "Northern Question" }]), id: "hidden-1" };
+  const { world: next } = applyEventImpactsToWorld({
+    events: [hiddenCarrier],
+    world,
+    boardOnlyEventIds: ["hidden-1"],
+  });
+
+  assert.equal(next.projects[0].status, "complete");
+  assert.equal(next.polityOverrides["Federal Republic of Ruritania"].name, "Federal Republic of Ruritania", "the completion effects were lost");
+  assert.deepEqual(next.projects[0].eventIds, [], "a Hidden event is not a timeline card to link to");
 });
 
 for (const op of ["cancel", "fail"]) {
@@ -383,7 +417,7 @@ test("an update carrying status complete releases the effects too", () => {
     world,
   });
 
-  assert.equal(next.polityOverrides.Ruritania.name, "Federal Republic of Ruritania");
+  assert.equal(next.polityOverrides["Federal Republic of Ruritania"].name, "Federal Republic of Ruritania");
   assert.ok(next.projects[0].onCompleteAppliedAt);
 });
 
@@ -400,7 +434,7 @@ test("an event may use the name its completed project introduces", () => {
     world,
   });
 
-  assert.equal(next.regionOwnershipOverrides["RUR.2_1"], "Ruritania", "the transfer minted a phantom polity");
+  assert.equal(next.regionOwnershipOverrides["RUR.2_1"], "Federal Republic of Ruritania", "the transfer lands on the renamed country");
 });
 
 test("onComplete region effects clear the dispute they settle", () => {
@@ -427,7 +461,7 @@ test("a completion matched by name alone fires and latches the same entry", () =
     world,
   });
 
-  assert.equal(next.polityOverrides.Ruritania.name, "Federal Republic of Ruritania");
+  assert.equal(next.polityOverrides["Federal Republic of Ruritania"].name, "Federal Republic of Ruritania");
   assert.ok(next.projects[0].onCompleteAppliedAt);
 });
 
@@ -484,7 +518,7 @@ test("the simulation closes what the advisor deferred, and the effects land then
     world: afterChat,
   });
 
-  assert.equal(afterJump.polityOverrides.Ruritania.name, "Federal Republic of Ruritania");
+  assert.equal(afterJump.polityOverrides["Federal Republic of Ruritania"].name, "Federal Republic of Ruritania");
   assert.equal(afterJump.projects[0].status, "complete");
 });
 

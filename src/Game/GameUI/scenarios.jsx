@@ -12,6 +12,7 @@ import {
   uploadScenarioAsset,
   useScenarioState,
 } from "../../runtime/scenarios.js";
+import { LABEL_FONT_SUGGESTIONS } from "../../runtime/mapSettings.js";
 
 const BAR_HEIGHT = 64;
 const TOP_BAR_OFFSET = "4.75rem";
@@ -106,13 +107,14 @@ const buildEditorState = (details) => {
   const advancedPrompts = {
     actions: prompts.actions ?? GAMEPLAY_PROMPT_DEFAULTS.actions,
     autoJumpForward: prompts.autoJumpForward ?? GAMEPLAY_PROMPT_DEFAULTS.autoJumpForward,
-    catalystCreation: prompts.catalystCreation ?? GAMEPLAY_PROMPT_DEFAULTS.catalystCreation,
-    catalystExecutor: prompts.catalystExecutor ?? GAMEPLAY_PROMPT_DEFAULTS.catalystExecutor,
-    catalystSummary: prompts.catalystSummary ?? GAMEPLAY_PROMPT_DEFAULTS.catalystSummary,
+    interactiveCreation: prompts.interactiveCreation ?? GAMEPLAY_PROMPT_DEFAULTS.interactiveCreation,
+    interactiveExecutor: prompts.interactiveExecutor ?? GAMEPLAY_PROMPT_DEFAULTS.interactiveExecutor,
+    interactiveSummary: prompts.interactiveSummary ?? GAMEPLAY_PROMPT_DEFAULTS.interactiveSummary,
     countryStatSheet: prompts.countryStatSheet ?? GAMEPLAY_PROMPT_DEFAULTS.countryStatSheet,
     descriptionToAction: prompts.descriptionToAction ?? GAMEPLAY_PROMPT_DEFAULTS.descriptionToAction,
     eventConsolidator: prompts.eventConsolidator ?? GAMEPLAY_PROMPT_DEFAULTS.eventConsolidator,
     gameMaster: prompts.gameMaster ?? GAMEPLAY_PROMPT_DEFAULTS.gameMaster,
+    idleDiplomacy: prompts.idleDiplomacy ?? GAMEPLAY_PROMPT_DEFAULTS.idleDiplomacy,
     jumpForward: prompts.jumpForward ?? GAMEPLAY_PROMPT_DEFAULTS.jumpForward,
     nextSpeaker: prompts.nextSpeaker ?? GAMEPLAY_PROMPT_DEFAULTS.nextSpeaker,
   };
@@ -503,7 +505,7 @@ const ScenarioEditor = ({
     onChange={(event) => onChange("labelFont", event.target.value)}
     />
     <datalist id="oh-label-font-options">
-    {["Georgia", "Times New Roman", "Garamond", "Palatino Linotype", "Impact", "Arial Black", "Arial", "Trebuchet MS", "Verdana", "Courier New", "Comic Sans MS"].map((font) => (
+    {LABEL_FONT_SUGGESTIONS.map((font) => (
       <option key={font} value={font} />
     ))}
     </datalist>

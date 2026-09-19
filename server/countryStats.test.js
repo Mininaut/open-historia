@@ -1,12 +1,15 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
+import { validateGameplayPayload } from "../src/Game/AI/gameplaySchemas.js";
+
 import {
   aggregateTerritorialEconomy,
   captureCountryStatsHistory,
   countryStatsTrackingMonthsElapsed,
   finalizeCountryStatSheet,
   guardCountryStatContinuity,
+  isCompleteCountryStatSheet,
   mergeCountryStatPatch,
   normalizeCountryStatSheet,
   normalizeCountryStatsTracking,
@@ -107,6 +110,142 @@ test("legacy sheets without a ledger stay readable with their declared totals", 
   assert.equal(normalizeCountryStatSheet(null), null);
   assert.equal(normalizeCountryStatSheet("text"), null);
   assert.equal(finalizeCountryStatSheet({ population: { total: 5 } }).statsSchemaVersion, 0);
+});
+
+test("an explicit non-territorial stat sheet can be complete without fabricated land, population or GDP", () => {
+  const sheet = finalizeCountryStatSheet({
+    territorialScope: "nonterritorial",
+    capital: "No fixed territorial capital",
+    continent: "Transnational",
+    government: "Non-territorial polity",
+    leader: "Test Leader",
+    stability: 50,
+    indices: {
+      sovereignty: 40,
+      foodAutonomy: 0,
+      energyAutonomy: 0,
+      economicIndependence: 35,
+      internalSecurity: 55,
+      internationalReputation: 20,
+    },
+    territorialComponents: [],
+    economy: {
+      gdpGrowth: 0,
+      currency: "EUR",
+      inflation: 0,
+      unemployment: 0,
+      publicDebt: 0,
+      budgetBalance: 0,
+    },
+    gdpBreakdown: { agriculture: 0, industry: 0, services: 100 },
+  });
+
+  assert.equal(sheet.statsSchemaVersion, 1);
+  assert.equal(sheet.territorialScope, "nonterritorial");
+  assert.deepEqual(sheet.territorialComponents, []);
+  assert.equal(sheet.population, undefined);
+  assert.equal(sheet.economy.gdp, undefined);
+  assert.equal(isCompleteCountryStatSheet(sheet), true);
+  assert.deepEqual(validateGameplayPayload("countryStatSheet", sheet), { valid: true, error: "" });
+
+  const distributedEconomy = finalizeCountryStatSheet({
+    ...sheet,
+    territorialComponents: [
+      { geography: "Distributed operations", group: "integrated", population: 2500, gdpPerCapita: 40000 },
+    ],
+  });
+  assert.equal(distributedEconomy.population.total, 2500);
+  assert.equal(distributedEconomy.economy.gdp, 100000000);
+  assert.equal(distributedEconomy.economy.gdpPerCapita, 40000);
+  assert.equal(isCompleteCountryStatSheet(distributedEconomy), true);
+});
+
+test("an empty territorial ledger is still invalid unless native code marks the polity non-territorial", () => {
+  const malformed = finalizeCountryStatSheet({
+    statsSchemaVersion: 1,
+    territorialScope: "mapped",
+    capital: "Nowhere",
+    continent: "Europe",
+    government: "Republic",
+    leader: "Test Leader",
+    stability: 50,
+    indices: {
+      sovereignty: 50,
+      foodAutonomy: 50,
+      energyAutonomy: 50,
+      economicIndependence: 50,
+      internalSecurity: 50,
+      internationalReputation: 50,
+    },
+    territorialComponents: [],
+    economy: {
+      gdpGrowth: 0,
+      currency: "EUR",
+      inflation: 0,
+      unemployment: 0,
+      publicDebt: 0,
+      budgetBalance: 0,
+    },
+    gdpBreakdown: { agriculture: 1, industry: 1, services: 98 },
+  });
+
+  assert.equal(isCompleteCountryStatSheet(malformed), false);
+  const validation = validateGameplayPayload("countryStatSheet", malformed);
+  assert.equal(validation.valid, false);
+  assert.match(validation.error, /may be empty only when .*nonterritorial/);
+});
+
+test("the canonical stat mutation boundary preserves an explicit empty non-territorial ledger", () => {
+  const landless = finalizeCountryStatSheet({
+    territorialScope: "nonterritorial",
+    capital: "No fixed territorial capital",
+    continent: "Transnational",
+    government: "Non-territorial polity",
+    leader: "Test Leader",
+    stability: 50,
+    indices: {
+      sovereignty: 40,
+      foodAutonomy: 0,
+      energyAutonomy: 0,
+      economicIndependence: 35,
+      internalSecurity: 55,
+      internationalReputation: 20,
+    },
+    territorialComponents: [],
+    economy: {
+      gdpGrowth: 0,
+      currency: "EUR",
+      inflation: 0,
+      unemployment: 0,
+      publicDebt: 0,
+      budgetBalance: 0,
+    },
+    gdpBreakdown: { agriculture: 0, industry: 0, services: 100 },
+  });
+
+  const persisted = mergeCountryStatPatch(
+    null,
+    landless,
+    { replaceComponents: true, continuity: { assessedDate: "2026-09-07" } },
+  );
+
+  assert.equal(persisted.territorialScope, "nonterritorial");
+  assert.deepEqual(persisted.territorialComponents, []);
+  assert.equal(persisted.statsSchemaVersion, 1);
+  assert.equal(isCompleteCountryStatSheet(persisted), true);
+  assert.deepEqual(validateGameplayPayload("countryStatSheet", persisted), { valid: true, error: "" });
+
+  // An ordinary mapped actor with an explicit empty replacement ledger must stay
+  // explicit too, so canonical validation can reject it instead of hiding the bug
+  // by silently converting [] back into an omitted/unknown field.
+  const mapped = mergeCountryStatPatch(
+    null,
+    { ...landless, territorialScope: "mapped", territorialComponents: [] },
+    { replaceComponents: true },
+  );
+  assert.equal(mapped.territorialScope, "mapped");
+  assert.deepEqual(mapped.territorialComponents, []);
+  assert.equal(isCompleteCountryStatSheet(mapped), false);
 });
 
 test("a stat patch scales the ledger to aggregate targets and records event continuity", () => {

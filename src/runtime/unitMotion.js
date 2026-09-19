@@ -1,4 +1,6 @@
-/*! Open Historia — unit motion, reach & detection math © 2026 Nicholas Krol, MIT (see src/Editor/LICENSE). */
+import { diffGameDays } from "./gameDates.js";
+
+/*! Open Historia — unit motion, reach & detection math © 2026 Nicholas Krol, AGPL-3.0-or-later (see LICENSE). */
 // Deterministic movement for map units — the reason a fleet sent to the
 // Atlantic visibly crosses it over several turns instead of teleporting, and
 // keeps working its station afterwards, without costing a single token.
@@ -92,16 +94,8 @@ export const maxTravelKm = (type, gameDate, days) =>
 // plain Gregorian date ("1200 BCE", "Third Age 3019"). null means "do not clamp":
 // a fantasy or ancient scenario must never freeze because its dates don't parse.
 export const daysBetweenDates = (from, to) => {
-  const parse = (value) => {
-    const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(value ?? "").trim());
-    if (!match) return null;
-    const time = Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3]));
-    return Number.isFinite(time) ? time : null;
-  };
-  const a = parse(from);
-  const b = parse(to);
-  if (a === null || b === null) return null;
-  return Math.max(0, Math.round((b - a) / 86400000));
+  const days = diffGameDays(from, to);
+  return days === null ? null : Math.max(0, days);
 };
 
 // ---- movement --------------------------------------------------------------
